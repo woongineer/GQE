@@ -7,43 +7,20 @@ from torch.nn import functional as F
 
 from data import data_load_and_process, new_data
 from model import GPT, GPTConfig
+from utils import make_op_pool, apply_circuit, select_token_and_en, plot_result
 
 num_qubit = 4
 dev = qml.device("default.qubit", wires=num_qubit)
 
 
-def make_op_pool(gate_type, num_qubit, num_param):
-    op_pool = []
-
-    for gate in gate_type:
-        if gate in ['RX', 'RY', 'RZ']:
-            for q in range(num_qubit):
-                for p in range(num_param):
-                    op_pool.append((gate, p, (q, None)))
-        elif gate in ['H', 'I']:
-            for q in range(num_qubit):
-                op_pool.append((gate, None, (q, None)))
-        elif gate == 'CNOT':
-            for control in range(num_qubit):
-                for target in range(num_qubit):
-                    if control != target:
-                        op_pool.append((gate, None, (control, target)))
-
-    return np.array(op_pool, dtype=object)
-
-
 class GPTQE(GPT):
-    def __init__(self, config):
-        super().__init__(config)
-
     def forward(self, idx):
         device = idx.device
         b, t = idx.size()
         pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
@@ -53,15 +30,11 @@ class GPTQE(GPT):
 
     def calculate_loss(self, tokens, energies):
         current_tokens, next_tokens = tokens[:, :-1], tokens[:, 1:]
-        # calculate the logits for the next possible tokens in the sequence
         logits = self(current_tokens)
-        # get the logit for the actual next token in the sequence
-        next_token_mask = torch.nn.functional.one_hot(
-            next_tokens, num_classes=self.config.vocab_size
-        )
+        next_token_mask = torch.nn.functional.one_hot(next_tokens, num_classes=self.config.vocab_size)
         next_token_logits = (logits * next_token_mask).sum(axis=2)
-        cumsum_logits = torch.cumsum(next_token_logits, dim=1)
-        loss = torch.mean(torch.square(cumsum_logits - energies))
+        total_logits = torch.sum(next_token_logits, dim=1)
+        loss = torch.mean(torch.square(total_logits - energies.squeeze()))
         return loss
 
     @torch.no_grad()
@@ -69,54 +42,22 @@ class GPTQE(GPT):
         idx = torch.zeros(size=(n_sequences, 1), dtype=int, device=device)
         total_logits = torch.zeros(size=(n_sequences, 1), device=device)
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
             logits = self(idx_cond)
-            # pluck the logits at the final step
             logits = logits[:, -1, :]
-            # set the logit of the first token so that its probability will be zero
             logits[:, 0] = float("inf")
-            # apply softmax to convert logits to (normalized) probabilities and scale by desired temperature
             probs = F.softmax(-logits / temperature, dim=-1)
-            # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
-            # # Accumulate logits
             total_logits += torch.gather(logits, index=idx_next, dim=1)
-            # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
         return idx, total_logits
-
-
-def apply_gate(gate, x):
-    gate_type, param_idx, qubit_idx = gate
-    ctrl_idx, target_idx = qubit_idx
-
-    # gate 적용
-    if gate_type == 'RX':
-        qml.RX(x[param_idx], wires=ctrl_idx)
-    elif gate_type == 'RY':
-        qml.RY(x[param_idx], wires=ctrl_idx)
-    elif gate_type == 'RZ':
-        qml.RZ(x[param_idx], wires=ctrl_idx)
-    elif gate_type == 'H':
-        qml.Hadamard(wires=ctrl_idx)
-    elif gate_type == 'CNOT':
-        qml.CNOT(wires=[ctrl_idx, target_idx])
-    elif gate_type == 'I':
-        qml.Identity(wires=ctrl_idx)
-
-
-def apply_circuit(x, circuit):
-    for gate in circuit:
-        apply_gate(gate, x)
 
 
 @qml.qnode(dev, interface='torch')
 def fidelity_circuit(x1, x2, circuit):
     apply_circuit(x1, circuit)
     qml.adjoint(apply_circuit)(x2, circuit)
-    return qml.probs(wires=range(4))
+    return qml.probs(wires=range(num_qubit))
 
 
 def compute_energy_for_ops(ops_and_data):
@@ -129,74 +70,44 @@ def compute_energy_for_ops(ops_and_data):
     return np.mean(energy_per_seq)
 
 
-def get_sequence_energies(op_seq, X1, X2, Y, num_workers=6):
+def get_sequence_energies(op_seq, X1, X2, Y, num_workers=4):
     with Pool(processes=num_workers) as pool:
         inputs = [(ops, X1, X2, Y) for ops in op_seq]
         energies = pool.map(compute_energy_for_ops, inputs)
     return np.array(energies, dtype=np.float32).reshape(-1, 1)
 
 
-def select_op_and_en(train_op_seq: np.ndarray, train_seq_en: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    k = 40
-    middle = 128 - (40 * 2)
-
-    sorted_indices = np.argsort(train_seq_en.flatten())
-
-    top_indices = sorted_indices[:k]
-    bottom_indices = sorted_indices[-k:]
-
-    middle_pool_indices = sorted_indices[k:-k]
-    interval_points = np.linspace(0, len(middle_pool_indices) - 1, num=middle)
-    middle_sample_indices_in_pool = np.round(interval_points).astype(int)
-    middle_indices = middle_pool_indices[middle_sample_indices_in_pool]
-
-    final_indices = np.concatenate([top_indices, bottom_indices, middle_indices])
-    np.random.shuffle(final_indices)
-
-    new_train_op_seq = train_op_seq[final_indices]
-    new_train_seq_en = train_seq_en[final_indices]
-
-    return new_train_op_seq, new_train_seq_en
-
-
 if __name__ == '__main__':
-    population_size = 10
+    population_size = 100
     batch_size = population_size
-    max_epoch = 100
+    max_epoch = 200
     gate_type = ['RX', 'RY', 'RZ', 'CNOT', 'H', 'I']
     op_pool = make_op_pool(gate_type=gate_type, num_qubit=num_qubit, num_param=num_qubit)
     op_pool_size = len(op_pool)
-    train_size = 128  # 256
+    train_size = 128
     n_batches = 8
     max_gate = 30
 
     X_train, _, Y_train, _ = data_load_and_process("kmnist", reduction_sz=num_qubit, train_len=population_size)
 
-    gpt = GPTQE(GPTConfig(
-        vocab_size=op_pool_size + 1,
-        block_size=max_gate,
-        dropout=0.2,
-        bias=False
-    )).to("cpu")
-    opt = gpt.configure_optimizers(
-        weight_decay=0.01, learning_rate=5e-5, betas=(0.9, 0.999), device_type="cpu"
-    )
+    gpt = GPTQE(GPTConfig(vocab_size=op_pool_size + 1, block_size=max_gate, dropout=0.2, bias=False))
+    opt = gpt.configure_optimizers(weight_decay=0.01, learning_rate=5e-5, betas=(0.9, 0.999), device_type="cpu")
     gpt.train()
     pred_Es_t = []
     true_Es_t = []
 
     X1, X2, Y = new_data(batch_size, X_train, Y_train)
     fidelity_history = []
+    loss_history = []
     for i in range(max_epoch):
-        train_op_pool_inds = np.random.randint(op_pool_size, size=(train_size * 1, max_gate))
+        train_op_pool_inds = np.random.randint(op_pool_size, size=(train_size * 3, max_gate))
         train_op_seq = op_pool[train_op_pool_inds]
-        train_token_seq = np.concatenate([
-            np.zeros(shape=(train_size * 1, 1), dtype=int),  # starting token is 0
-            train_op_pool_inds + 1  # shift operator inds by one
-        ], axis=1)
+        train_token_seq = np.concatenate([np.zeros(shape=(train_size * 3, 1),
+                                                   dtype=int), train_op_pool_inds + 1], axis=1)
+
         train_seq_en = get_sequence_energies(train_op_seq, X1, X2, Y)
 
-        train_op_seq, train_seq_en = select_op_and_en(train_op_seq, train_seq_en)
+        train_token_seq, train_seq_en = select_token_and_en(train_token_seq, train_seq_en, train_size)
 
         tokens = torch.from_numpy(train_token_seq)
         energies = torch.from_numpy(train_seq_en)
@@ -216,16 +127,15 @@ if __name__ == '__main__':
         print(f"Iteration: {i + 1}, Loss: {losses[-1]}")
 
         # if i == 0 or (i + 1) % 10 == 0:
-            # For GPT evaluation
         gpt.eval()
         gen_token_seq, pred_Es = gpt.generate(
             n_sequences=100,
             max_new_tokens=max_gate,
-            temperature=0.01,  # Use a low temperature to emphasize the difference in logits
+            temperature=0.01,
             device="cpu"
         )
         pred_Es = pred_Es.numpy()
-        print(gen_token_seq)
+        print(gen_token_seq[0])
 
         gen_inds = (gen_token_seq[:, 1:] - 1).numpy()
         gen_op_seq = op_pool[gen_inds]
@@ -241,5 +151,7 @@ if __name__ == '__main__':
 
         gpt.train()
         fidelity_history.append(ave_E)
+        loss_history.append(losses[-1])
 
-    print(f"fidelity_history: {fidelity_history}")
+    plot_result(fidelity_history, 'data_fix_fidelity', 'data_fix_fidelity.png')
+    plot_result(loss_history, 'data_fix_loss', 'data_fix_loss.png')

@@ -72,6 +72,29 @@ def new_data(batch_sz, X, Y):
     Y_new_tensor = torch.from_numpy(Y_new_array).float()
     return X1_new_tensor, X2_new_tensor, Y_new_tensor
 
+
+def new_data_diffH(batch_sz, X, Y):
+    X1_new, X2_new, Y_new = [], [], []
+    for i in range(batch_sz):
+        n, m = pnp.random.randint(len(X)), pnp.random.randint(len(X))
+        X1_new.append(X[n])
+        X2_new.append(X[m])
+        Y_new.append(1 if Y[n] == Y[m] else -1)
+
+    # X1_new 처리
+    X1_new_array = pnp.array(X1_new)
+    X1_new_tensor = torch.from_numpy(X1_new_array).float()
+
+    # X2_new 처리
+    X2_new_array = pnp.array(X2_new)
+    X2_new_tensor = torch.from_numpy(X2_new_array).float()
+
+    # Y_new 처리
+    Y_new_array = pnp.array(Y_new)
+    Y_new_tensor = torch.from_numpy(Y_new_array).float()
+    return X1_new_tensor, X2_new_tensor, Y_new_tensor
+
+
 def get_class_balanced_batch(batch_sz, X, Y):
     """클래스별로 dc개씩 균등하게 뽑은 batch 반환"""
     while True:
