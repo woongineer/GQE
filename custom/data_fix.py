@@ -77,16 +77,20 @@ def get_sequence_energies(op_seq, X1, X2, Y, num_workers=4):
     return np.array(energies, dtype=np.float32).reshape(-1, 1)
 
 
+def normalize_E(E, mu, sigma):
+    return (E - mu) / sigma
+
+
 if __name__ == '__main__':
-    population_size = 100
+    population_size = 30
     batch_size = population_size
-    max_epoch = 200
+    max_epoch = 1000
     gate_type = ['RX', 'RY', 'RZ', 'CNOT', 'H', 'I']
     op_pool = make_op_pool(gate_type=gate_type, num_qubit=num_qubit, num_param=num_qubit)
     op_pool_size = len(op_pool)
     train_size = 128
     n_batches = 8
-    max_gate = 30
+    max_gate = 20
 
     X_train, _, Y_train, _ = data_load_and_process("kmnist", reduction_sz=num_qubit, train_len=population_size)
 
@@ -97,6 +101,8 @@ if __name__ == '__main__':
     true_Es_t = []
 
     X1, X2, Y = new_data(batch_size, X_train, Y_train)
+    mu, sigma = None, None
+
     fidelity_history = []
     loss_history = []
     for i in range(max_epoch):
@@ -106,6 +112,11 @@ if __name__ == '__main__':
                                                    dtype=int), train_op_pool_inds + 1], axis=1)
 
         train_seq_en = get_sequence_energies(train_op_seq, X1, X2, Y)
+        if mu is None:
+            mu = float(train_seq_en.mean())
+            sigma = float(train_seq_en.std()) + 1e-8
+            print(f"[scale] μ={mu:.6f}, σ={sigma:.6f}")
+        train_seq_en = normalize_E(train_seq_en, mu, sigma)
 
         train_token_seq, train_seq_en = select_token_and_en(train_token_seq, train_seq_en, train_size)
 
@@ -140,8 +151,9 @@ if __name__ == '__main__':
         gen_inds = (gen_token_seq[:, 1:] - 1).numpy()
         gen_op_seq = op_pool[gen_inds]
         true_Es = get_sequence_energies(gen_op_seq, X1, X2, Y)
+        true_Es_norm = normalize_E(true_Es, mu, sigma)
 
-        mae = np.mean(np.abs(pred_Es - true_Es))
+        mae = np.mean(np.abs(pred_Es - true_Es_norm))
         ave_E = np.mean(true_Es)
 
         pred_Es_t.append(pred_Es)
@@ -153,5 +165,5 @@ if __name__ == '__main__':
         fidelity_history.append(ave_E)
         loss_history.append(losses[-1])
 
-    plot_result(fidelity_history, 'data_fix_fidelity', 'data_fix_fidelity.png')
-    plot_result(loss_history, 'data_fix_loss', 'data_fix_loss.png')
+    plot_result(fidelity_history, 'data_fix_fidelity_1000', 'data_fix_fidelity_1000.png')
+    plot_result(loss_history, 'data_fix_loss_1000', 'data_fix_loss_1000.png')

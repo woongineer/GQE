@@ -34,6 +34,10 @@ class GPTQE(GPT):
         next_token_mask = torch.nn.functional.one_hot(next_tokens, num_classes=self.config.vocab_size)
         next_token_logits = (logits * next_token_mask).sum(axis=2)
         cumsum_logits = torch.cumsum(next_token_logits, dim=1)
+
+        k = torch.arange(1, cumsum_logits.size(1) + 1, device=cumsum_logits.device).float()
+        cumsum_logits = cumsum_logits / k
+
         loss = torch.mean(torch.square(cumsum_logits - energies))
         return loss
 
@@ -87,10 +91,14 @@ def get_sequence_energies(op_seq, X1, X2, Y, num_workers=4):
     return np.array(energies, dtype=np.float32)
 
 
+def normalize_E(E, mu, sigma):
+    return (E - mu) / sigma
+
+
 if __name__ == '__main__':
     population_size = 30
     batch_size = population_size
-    max_epoch = 100
+    max_epoch = 400
     gate_type = ['RX', 'RY', 'RZ', 'CNOT', 'H', 'I']
     op_pool = make_op_pool(gate_type=gate_type, num_qubit=num_qubit, num_param=num_qubit)
     op_pool_size = len(op_pool)
@@ -107,6 +115,8 @@ if __name__ == '__main__':
     true_Es_t = []
 
     X1, X2, Y = new_data_diffH(batch_size, X_train, Y_train)
+    mu, sigma = None, None
+
     fidelity_history = []
     loss_history = []
     for i in range(max_epoch):
@@ -116,6 +126,11 @@ if __name__ == '__main__':
                                                    dtype=int), train_op_pool_inds + 1], axis=1)
 
         train_seq_en = get_sequence_energies(train_op_seq, X1, X2, Y)
+        if mu is None:
+            mu = float(train_seq_en.mean())
+            sigma = float(train_seq_en.std()) + 1e-8
+            print(f"[scale] μ={mu:.6f}, σ={sigma:.6f}")
+        train_seq_en = normalize_E(train_seq_en, mu, sigma)
 
         train_token_seq, train_seq_en = select_token_and_en(train_token_seq, train_seq_en, train_size)
 
@@ -150,8 +165,9 @@ if __name__ == '__main__':
         gen_inds = (gen_token_seq[:, 1:] - 1).numpy()
         gen_op_seq = op_pool[gen_inds]
         true_Es = get_sequence_energies(gen_op_seq, X1, X2, Y)[:, -1].reshape(-1, 1)
+        true_Es_norm = normalize_E(true_Es, mu, sigma)
 
-        mae = np.mean(np.abs(pred_Es - true_Es))
+        mae = np.mean(np.abs(pred_Es - true_Es_norm))
         ave_E = np.mean(true_Es)
 
         pred_Es_t.append(pred_Es)

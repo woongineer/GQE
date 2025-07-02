@@ -42,7 +42,7 @@ class GPTQE(GPT):
         idx = torch.zeros(size=(n_sequences, 1), dtype=int, device=device)
         total_logits = torch.zeros(size=(n_sequences, 1), device=device)
         for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            idx_cond = (idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:])
             logits = self(idx_cond)
             logits = logits[:, -1, :]
             logits[:, 0] = float("inf")
@@ -77,10 +77,14 @@ def get_sequence_energies(op_seq, X1, X2, Y, num_workers=4):
     return np.array(energies, dtype=np.float32).reshape(-1, 1)
 
 
+def normalize_E(E, mu, sigma):
+    return (E - mu) / sigma
+
+
 if __name__ == '__main__':
     population_size = 30
     batch_size = population_size
-    max_epoch = 100
+    max_epoch = 400
     gate_type = ['RX', 'RY', 'RZ', 'CNOT', 'H', 'I']
     op_pool = make_op_pool(gate_type=gate_type, num_qubit=num_qubit, num_param=num_qubit)
     op_pool_size = len(op_pool)
@@ -97,6 +101,8 @@ if __name__ == '__main__':
     true_Es_t = []
 
     X1, X2, Y = new_data_diffH(batch_size, X_train, Y_train)
+    mu, sigma = None, None
+
     fidelity_history = []
     loss_history = []
     for i in range(max_epoch):
@@ -106,6 +112,11 @@ if __name__ == '__main__':
                                                    dtype=int), train_op_pool_inds + 1], axis=1)
 
         train_seq_en = get_sequence_energies(train_op_seq, X1, X2, Y)
+        if mu is None:
+            mu = float(train_seq_en.mean())
+            sigma = float(train_seq_en.std()) + 1e-8
+            print(f"[scale] μ={mu:.6f}, σ={sigma:.6f}")
+        train_seq_en = normalize_E(train_seq_en, mu, sigma)
 
         train_token_seq, train_seq_en = select_token_and_en(train_token_seq, train_seq_en, train_size)
 
@@ -140,8 +151,9 @@ if __name__ == '__main__':
         gen_inds = (gen_token_seq[:, 1:] - 1).numpy()
         gen_op_seq = op_pool[gen_inds]
         true_Es = get_sequence_energies(gen_op_seq, X1, X2, Y)
+        true_Es_norm = normalize_E(true_Es, mu, sigma)
 
-        mae = np.mean(np.abs(pred_Es - true_Es))
+        mae = np.mean(np.abs(pred_Es - true_Es_norm))
         ave_E = np.mean(true_Es)
 
         pred_Es_t.append(pred_Es)
