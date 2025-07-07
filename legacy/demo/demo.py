@@ -162,7 +162,7 @@ if __name__ == '__main__':
     current_mae = 10000
     gpt.train()
 
-    for i in range(50):
+    for i in range(2000):
         # Shuffle batches of the training set
         np.random.shuffle(train_inds)
         token_batches = torch.tensor_split(tokens[train_inds], n_batches)
@@ -177,109 +177,30 @@ if __name__ == '__main__':
             opt.step()
             loss_record += loss.item() / n_batches
         losses.append(loss_record)
-        print(f"Iteration: {i + 1}, Loss: {losses[-1]}")
-        if (i + 1) % 10 == 0:
+        # print(f"Iteration: {i + 1}, Loss: {losses[-1]}")
+        # if (i + 1) % 10 == 0:
             # For GPT evaluation
-            gpt.eval()
-            gen_token_seq, pred_Es = gpt.generate(
-                n_sequences=100,
-                max_new_tokens=seq_len,
-                temperature=0.001,  # Use a low temperature to emphasize the difference in logits
-                device="cpu"
-            )
-            pred_Es = pred_Es.cpu().numpy()
+        gpt.eval()
+        gen_token_seq, pred_Es = gpt.generate(
+            n_sequences=100,
+            max_new_tokens=seq_len,
+            temperature=0.001,  # Use a low temperature to emphasize the difference in logits
+            device="cpu"
+        )
+        pred_Es = pred_Es.cpu().numpy()
 
-            gen_inds = (gen_token_seq[:, 1:] - 1).cpu().numpy()
-            gen_op_seq = op_pool[gen_inds]
-            true_Es = get_sequence_energies(gen_op_seq)[:, -1].reshape(-1, 1)
+        gen_inds = (gen_token_seq[:, 1:] - 1).cpu().numpy()
+        gen_op_seq = op_pool[gen_inds]
+        true_Es = get_sequence_energies(gen_op_seq)[:, -1].reshape(-1, 1)
 
-            mae = np.mean(np.abs(pred_Es - true_Es))
-            ave_E = np.mean(true_Es)
+        mae = np.mean(np.abs(pred_Es - true_Es))
+        ave_E = np.mean(true_Es)
 
-            pred_Es_t.append(pred_Es)
-            true_Es_t.append(true_Es)
+        pred_Es_t.append(pred_Es)
+        true_Es_t.append(true_Es)
 
-            print(f"Iteration: {i + 1}, Loss: {losses[-1]}, MAE: {mae}, Ave E: {ave_E}")
+        print(f"Iteration: {i + 1}, Loss: {losses[-1]}, MAE: {mae}, Ave E: {ave_E}")
 
-            if mae < current_mae:
-                current_mae = mae
-                os.makedirs(f"./seq_len={seq_len}", exist_ok=True)
-                torch.save(gpt, f"./seq_len={seq_len}/gqe.pt")
-                print("Saved model!")
+        gpt.train()
 
-            gpt.train()
 
-    pred_Es_t = np.concatenate(pred_Es_t, axis=1)
-    true_Es_t = np.concatenate(true_Es_t, axis=1)
-
-    # 5. 결과 시각화
-    hvplot.extension('matplotlib')
-
-    losses_df = pd.DataFrame({"loss": losses})
-    losses_df.to_csv(f"./seq_len={seq_len}/trial7/losses.csv", index=False)
-    loss_fig = losses_df["loss"].hvplot(
-        title="Training loss progress", ylabel="loss", xlabel="Training epochs", logy=True
-    ).opts(fig_size=600, fontscale=2, aspect=1.2)
-    loss_fig
-
-    df_true = pd.read_csv(f"./seq_len={seq_len}/trial7/true_Es_t.csv").iloc[:, 1:]
-    df_pred = pd.read_csv(f"./seq_len={seq_len}/trial7/pred_Es_t.csv").iloc[:, 1:]
-
-    df_true.columns = df_true.columns.astype(int)
-    df_pred.columns = df_pred.columns.astype(int)
-
-    df_trues_stats = pd.concat([df_true.mean(axis=0), df_true.min(axis=0), df_true.max(axis=0)], axis=1).reset_index()
-    df_trues_stats.columns = ["Training Iterations", "Ave True E", "Min True E", "Max True E"]
-
-    df_preds_stats = pd.concat([df_pred.mean(axis=0), df_pred.min(axis=0), df_pred.max(axis=0)], axis=1).reset_index()
-    df_preds_stats.columns = ["Training Iterations", "Ave Pred E", "Min Pred E", "Max Pred E"]
-
-    fig = (
-        df_trues_stats.hvplot.scatter(x="Training Iterations", y="Ave True E", label="Mean True Energies") *
-        df_trues_stats.hvplot.line(x="Training Iterations", y="Ave True E", alpha=0.5, linewidth=1) *
-        df_trues_stats.hvplot.area(x="Training Iterations", y="Min True E", y2="Max True E", alpha=0.1)
-    ) * (
-        df_preds_stats.hvplot.scatter(x="Training Iterations", y="Ave Pred E", label="Mean Predicted Energies") *
-        df_preds_stats.hvplot.line(x="Training Iterations", y="Ave Pred E", alpha=0.5, linewidth=1) *
-        df_preds_stats.hvplot.area(x="Training Iterations", y="Min Pred E", y2="Max Pred E", alpha=0.1)
-    )
-    fig = fig * hv.Curve([[0, grd_E], [10000, grd_E]], label="Ground State Energy").opts(color="k", alpha=0.4,
-                                                                                         linestyle="dashed")
-    fig = fig.opts(ylabel="Sequence Energies", title="GQE Evaluations", fig_size=600, fontscale=2)
-    fig
-
-    # 6. 모델별 성능 비교
-    gen_token_seq_, _ = gpt.generate(
-        n_sequences=1024,
-        max_new_tokens=seq_len,
-        temperature=0.001,
-        device="cpu"
-    )
-    gen_inds_ = (gen_token_seq_[:, 1:] - 1).cpu().numpy()
-    gen_op_seq_ = op_pool[gen_inds_]
-    true_Es_ = get_subsequence_energies(gen_op_seq_)[:, -1].reshape(-1, 1)
-
-    loaded = torch.load(f"./seq_len={seq_len}/trial7/gqe.pt")
-    loaded_token_seq_, _ = loaded.generate(
-        n_sequences=1024,
-        max_new_tokens=seq_len,
-        temperature=0.001,
-        device="cpu"
-    )
-    loaded_inds_ = (loaded_token_seq_[:, 1:] - 1).cpu().numpy()
-    loaded_op_seq_ = op_pool[loaded_inds_]
-    loaded_true_Es_ = get_subsequence_energies(loaded_op_seq_)[:, -1].reshape(-1, 1)
-
-    df_compare_Es = pd.DataFrame({
-        "Source": ["Random", "Latest Model", "Best Model"],
-        "Aves": [train_sub_seq_en[:, -1].mean(), true_Es_.mean(), loaded_true_Es_.mean()],
-        "Mins": [train_sub_seq_en[:, -1].min(), true_Es_.min(), loaded_true_Es_.min()],
-        "Maxs": [train_sub_seq_en[:, -1].max(), true_Es_.max(), loaded_true_Es_.max()],
-        "Mins_error": [
-            abs(train_sub_seq_en[:, -1].min() - grd_E),
-            abs(true_Es_.min() - grd_E),
-            abs(loaded_true_Es_.min() - grd_E),
-        ],
-    })
-    print(df_compare_Es)
-###########수정된 부분 끝##########

@@ -1,3 +1,4 @@
+import json
 from multiprocessing import Pool
 
 import numpy as np
@@ -7,7 +8,7 @@ from torch.nn import functional as F
 
 from data import data_load_and_process, new_data
 from model import GPT, GPTConfig
-from utils import make_op_pool, apply_circuit, select_token_and_en, plot_result
+from utils import make_op_pool, apply_circuit, select_token_and_en, plot_result, record_generated_results
 
 num_qubit = 4
 dev = qml.device("default.qubit", wires=num_qubit)
@@ -82,9 +83,9 @@ def normalize_E(E, mu, sigma):
 
 
 if __name__ == '__main__':
-    population_size = 30
+    population_size = 10
     batch_size = population_size
-    max_epoch = 1000
+    max_epoch = 10000
     gate_type = ['RX', 'RY', 'RZ', 'CNOT', 'H', 'I']
     op_pool = make_op_pool(gate_type=gate_type, num_qubit=num_qubit, num_param=num_qubit)
     op_pool_size = len(op_pool)
@@ -105,6 +106,7 @@ if __name__ == '__main__':
 
     fidelity_history = []
     loss_history = []
+    all_gen_records = []
     for i in range(max_epoch):
         train_op_pool_inds = np.random.randint(op_pool_size, size=(train_size * 3, max_gate))
         train_op_seq = op_pool[train_op_pool_inds]
@@ -164,6 +166,9 @@ if __name__ == '__main__':
         gpt.train()
         fidelity_history.append(ave_E)
         loss_history.append(losses[-1])
+        record_generated_results(all_gen_records, i + 1, gen_op_seq, true_Es)
 
-    plot_result(fidelity_history, 'data_fix_fidelity_1000', 'data_fix_fidelity_1000.png')
-    plot_result(loss_history, 'data_fix_loss_1000', 'data_fix_loss_1000.png')
+    plot_result(fidelity_history, 'data_fix_fidelity_10000', 'data_fix_fidelity_10000.png')
+    plot_result(loss_history, 'data_fix_loss_10000', 'data_fix_loss_10000.png')
+    with open("result/all_generated_results.json", "w") as f:
+        json.dump(all_gen_records, f, indent=2)

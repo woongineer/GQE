@@ -81,3 +81,14 @@ def plot_result(data, title, filename):
     plt.savefig(filename)
     plt.close()
 
+
+def record_generated_results(all_records, iteration, gen_op_seq, energies):
+    for op, e in zip(gen_op_seq, energies):
+        # 각 gate tuple을 list로 바꿔 JSON 직렬화 가능하게
+        op_serialized = [[g if not isinstance(g, np.ndarray) else g.tolist() for g in gate] for gate in op]
+        record = {
+            "GeneratedIteration": iteration,
+            "gen_op_seq": op_serialized,
+            "energy": float(e)
+        }
+        all_records.append(record)
