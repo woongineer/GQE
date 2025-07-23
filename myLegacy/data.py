@@ -53,11 +53,18 @@ def data_load_and_process(dataset="mnist", reduction_sz: int = 4, train_len=400,
 
 def new_data(batch_sz, X, Y):
     X1_new, X2_new, Y_new = [], [], []
+    data_store = {}
+    data_store_raw_X = []
+    data_store_raw_Y = []
     for i in range(batch_sz):
         n, m = pnp.random.randint(len(X)), pnp.random.randint(len(X))
         X1_new.append(X[n])
         X2_new.append(X[m])
         Y_new.append(1 if Y[n] == Y[m] else 0)
+        data_store_raw_X.append(X[n])
+        data_store_raw_X.append(X[m])
+        data_store_raw_Y.append(Y[n])
+        data_store_raw_Y.append(Y[m])
 
     # X1_new 처리
     X1_new_array = pnp.array(X1_new)
@@ -70,7 +77,11 @@ def new_data(batch_sz, X, Y):
     # Y_new 처리
     Y_new_array = pnp.array(Y_new)
     Y_new_tensor = torch.from_numpy(Y_new_array).float()
-    return X1_new_tensor, X2_new_tensor, Y_new_tensor
+
+    data_store['raw_X'] = data_store_raw_X
+    data_store['raw_Y'] = data_store_raw_Y
+    data_store['processed'] = [X1_new_tensor, X2_new_tensor, Y_new_tensor]
+    return X1_new_tensor, X2_new_tensor, Y_new_tensor, data_store
 
 
 def new_data_diffH(batch_sz, X, Y):

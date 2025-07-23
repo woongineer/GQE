@@ -5,10 +5,11 @@ import numpy as np
 import pennylane as qml
 import torch
 from torch.nn import functional as F
+import pickle
 
-from custom.data import data_load_and_process, new_data
-from custom.model import GPT, GPTConfig
-from custom.utils import make_op_pool, apply_circuit, select_token_and_en, plot_result, record_generated_results
+from myLegacy.data import data_load_and_process, new_data
+from myLegacy.model import GPT, GPTConfig
+from myLegacy.utils import make_op_pool, apply_circuit, select_token_and_en, plot_result, record_generated_results
 
 num_qubit = 4
 dev = qml.device("default.qubit", wires=num_qubit)
@@ -41,7 +42,6 @@ class GPTQE(GPT):
     @torch.no_grad()
     def generate(self, n_sequences, max_new_tokens, temperature=1.0, device="cpu"):
         idx = torch.zeros(size=(n_sequences, 1), dtype=int, device=device)
-        total_logp = torch.zeros((n_sequences, 1), device=device)
         total_energy = torch.zeros((n_sequences, 1), device=device)
 
         for _ in range(max_new_tokens):
@@ -55,12 +55,11 @@ class GPTQE(GPT):
 
             idx_next = torch.multinomial(probs, num_samples=1)
 
-            total_logp += torch.gather(log_probs, 1, idx_next)
             total_energy += torch.gather(logits, 1, idx_next)
 
             idx = torch.cat((idx, idx_next), dim=1)
 
-        return idx, total_logp, total_energy
+        return idx, total_energy
 
 
 @qml.qnode(dev, interface='torch')
@@ -96,20 +95,10 @@ def temperature(T_max, T_min, max_epoch, epoch):
     return T_max * ratio
 
 
-class Encoder(torch.nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim):
-        super().__init__()
-        self.linear1 = torch.nn.Linear(in_dim, hidden_dim)
-        self.linear2 = torch.nn.Linear(hidden_dim, out_dim)
-
-    def forward(self, x):  # 예시: x는 (B, F)
-        return self.linear2(torch.relu(self.linear1(x)))
-
-
 if __name__ == '__main__':
-    population_size = 8
-    batch_size = population_size
-    max_epoch = 100
+    population_size = 1000
+    batch_size = 8
+    max_epoch = 20
     gate_type = ['RX', 'RY', 'RZ', 'CNOT', 'H', 'I']
     op_pool = make_op_pool(gate_type=gate_type, num_qubit=num_qubit, num_param=num_qubit)
     op_pool_size = len(op_pool)
@@ -125,10 +114,8 @@ if __name__ == '__main__':
     gpt = GPTQE(GPTConfig(vocab_size=op_pool_size + 1, block_size=max_gate, dropout=0.2, bias=False))
     opt = gpt.configure_optimizers(weight_decay=0.01, learning_rate=5e-5, betas=(0.9, 0.999), device_type="cpu")
     gpt.train()
-    pred_Es_t = []
-    true_Es_t = []
 
-    X1, X2, Y = new_data(batch_size, X_train, Y_train)
+    X1, X2, Y, data_store = new_data(batch_size, X_train, Y_train)
     mu, sigma = None, None
 
     fidelity_history = []
@@ -136,7 +123,7 @@ if __name__ == '__main__':
     all_gen_records = []
     for i in range(max_epoch):
         gpt.eval()
-        train_token_seq_torch, _, _ = gpt.generate(
+        train_token_seq_torch, _ = gpt.generate(
             n_sequences=train_size * 3,
             max_new_tokens=max_gate,
             temperature=temperature(T_max=T_max, T_min=T_min, max_epoch=max_epoch, epoch=i),
@@ -178,7 +165,7 @@ if __name__ == '__main__':
 
         # if i == 0 or (i + 1) % 10 == 0:
         gpt.eval()
-        gen_token_seq, _, pred_Es = gpt.generate(
+        gen_token_seq, pred_Es = gpt.generate(
             n_sequences=100,
             max_new_tokens=max_gate,
             temperature=0.01,
@@ -192,19 +179,20 @@ if __name__ == '__main__':
         true_Es = get_sequence_energies(gen_op_seq, X1, X2, Y)
         true_Es_norm = normalize_E(true_Es, mu, sigma)
 
-        mae = np.mean(np.abs(pred_Es - true_Es_norm))
+        ave_pred_E = np.mean(pred_Es)
         ave_E = np.mean(true_Es)
 
-        pred_Es_t.append(pred_Es)
-        true_Es_t.append(true_Es)
-
-        print(f"Iter: {i + 1}, Loss: {losses[-1]}, MAE: {mae}, Ave True E: {ave_E}")
+        print(f"Iter: {i + 1}, Loss: {losses[-1]}, Ave Pred E: {ave_pred_E}, Ave True E: {ave_E}")
 
         fidelity_history.append(ave_E)
         loss_history.append(losses[-1])
         record_generated_results(all_gen_records, i + 1, gen_op_seq, true_Es)
 
-    plot_result(fidelity_history, 'data_fix_sampling_fidelity', 'data_fix_smapling_fidelity.png')
-    plot_result(loss_history, 'data_fix_sampling_loss', 'data_fix_sampling_loss.png')
-    with open("../custom/result/data_fix_sampling_generated_circuit.json", "w") as f:
+    name = 'data_fix_sampling'
+
+    plot_result(fidelity_history, f'{name}_fidelity', f'{name}_fidelity.png')
+    plot_result(loss_history, f'{name}_loss', f'{name}_loss.png')
+    with open(f"{name}_generated_circuit.json", "w") as f:
         json.dump(all_gen_records, f, indent=2)
+    with open(f"{name}_data_store.pkl", "wb") as f:
+        pickle.dump(data_store, f)
