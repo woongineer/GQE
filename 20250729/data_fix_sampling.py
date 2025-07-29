@@ -7,9 +7,9 @@ import torch
 from torch.nn import functional as F
 import pickle
 
-from myLegacy.data import data_load_and_process, new_data
-from myLegacy.model import GPT, GPTConfig
-from myLegacy.utils import make_op_pool, apply_circuit, select_token_and_en, plot_result, record_generated_results
+from NOTUSE.my_legacy_data_fix_py_is_first_hope.data import data_load_and_process, new_data
+from NOTUSE.my_legacy_data_fix_py_is_first_hope.model import GPT, GPTConfig
+from NOTUSE.my_legacy_data_fix_py_is_first_hope.utils import make_op_pool, apply_circuit, select_token_and_en, plot_result, record_generated_results
 
 num_qubit = 4
 dev = qml.device("default.qubit", wires=num_qubit)

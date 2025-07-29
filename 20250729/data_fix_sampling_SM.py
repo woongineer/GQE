@@ -5,33 +5,14 @@ import numpy as np
 import pennylane as qml
 import torch
 from torch.nn import functional as F
+import pickle
 
-from myLegacy.data import data_load_and_process, new_data
-from myLegacy.model import GPT, GPTConfig
-from myLegacy.utils import apply_circuit, select_token_and_en, plot_result, record_generated_results
+from NOTUSE.my_legacy_data_fix_py_is_first_hope.data import data_load_and_process, new_data
+from NOTUSE.my_legacy_data_fix_py_is_first_hope.small_model import GPT, GPTConfig
+from NOTUSE.my_legacy_data_fix_py_is_first_hope.utils import make_op_pool, apply_circuit, select_token_and_en, plot_result, record_generated_results
 
 num_qubit = 4
 dev = qml.device("default.qubit", wires=num_qubit)
-
-
-def make_op_pool(gate_type, num_qubit, num_param):
-    op_pool = []
-
-    for gate in gate_type:
-        if gate in ['RX', 'RY', 'RZ']:
-            for q in range(num_qubit):
-                for p in range(num_param):
-                    op_pool.append((gate, p, (q, None)))
-        elif gate in ['H', 'I']:
-            for q in range(num_qubit):
-                op_pool.append((gate, None, (q, None)))
-        elif gate == 'CNOT':
-            for control in range(num_qubit):
-                for target in range(num_qubit):
-                    if control != target:
-                        op_pool.append((gate, None, (control, target)))
-
-    return np.array(op_pool, dtype=object)
 
 
 class GPTQE(GPT):
@@ -61,6 +42,7 @@ class GPTQE(GPT):
     @torch.no_grad()
     def generate(self, n_sequences, max_new_tokens, temperature=1.0, device="cpu"):
         idx = torch.zeros(size=(n_sequences, 1), dtype=int, device=device)
+        total_energy = torch.zeros((n_sequences, 1), device=device)
 
         for _ in range(max_new_tokens):
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
@@ -73,9 +55,11 @@ class GPTQE(GPT):
 
             idx_next = torch.multinomial(probs, num_samples=1)
 
+            total_energy += torch.gather(logits, 1, idx_next)
+
             idx = torch.cat((idx, idx_next), dim=1)
 
-        return idx
+        return idx, total_energy
 
 
 @qml.qnode(dev, interface='torch')
@@ -112,9 +96,9 @@ def temperature(T_max, T_min, max_epoch, epoch):
 
 
 if __name__ == '__main__':
-    population_size = 8
-    batch_size = population_size
-    max_epoch = 100
+    population_size = 1000
+    batch_size = 8
+    max_epoch = 20
     gate_type = ['RX', 'RY', 'RZ', 'CNOT', 'H', 'I']
     op_pool = make_op_pool(gate_type=gate_type, num_qubit=num_qubit, num_param=num_qubit)
     op_pool_size = len(op_pool)
@@ -124,13 +108,14 @@ if __name__ == '__main__':
     T_max = 1000
     T_min = 0.01
 
+
     X_train, _, Y_train, _ = data_load_and_process("kmnist", reduction_sz=num_qubit, train_len=population_size)
 
     gpt = GPTQE(GPTConfig(vocab_size=op_pool_size + 1, block_size=max_gate, dropout=0.2, bias=False))
     opt = gpt.configure_optimizers(weight_decay=0.01, learning_rate=5e-5, betas=(0.9, 0.999), device_type="cpu")
     gpt.train()
 
-    X1, X2, Y = new_data(batch_size, X_train, Y_train)
+    X1, X2, Y, data_store = new_data(batch_size, X_train, Y_train)
     mu, sigma = None, None
 
     fidelity_history = []
@@ -138,7 +123,7 @@ if __name__ == '__main__':
     all_gen_records = []
     for i in range(max_epoch):
         gpt.eval()
-        train_token_seq_torch = gpt.generate(
+        train_token_seq_torch, _ = gpt.generate(
             n_sequences=train_size * 3,
             max_new_tokens=max_gate,
             temperature=temperature(T_max=T_max, T_min=T_min, max_epoch=max_epoch, epoch=i),
@@ -180,12 +165,13 @@ if __name__ == '__main__':
 
         # if i == 0 or (i + 1) % 10 == 0:
         gpt.eval()
-        gen_token_seq = gpt.generate(
+        gen_token_seq, pred_Es = gpt.generate(
             n_sequences=100,
             max_new_tokens=max_gate,
             temperature=0.01,
             device="cpu"
         )
+        pred_Es = pred_Es.numpy()
         print(gen_token_seq[0])
 
         gen_inds = (gen_token_seq[:, 1:] - 1).numpy()
@@ -193,15 +179,20 @@ if __name__ == '__main__':
         true_Es = get_sequence_energies(gen_op_seq, X1, X2, Y)
         true_Es_norm = normalize_E(true_Es, mu, sigma)
 
+        ave_pred_E = np.mean(pred_Es)
         ave_E = np.mean(true_Es)
 
-        print(f"Iter: {i + 1}, Loss: {losses[-1]}, Ave True E: {ave_E}")
+        print(f"Iter: {i + 1}, Loss: {losses[-1]}, Ave Pred E: {ave_pred_E}, Ave True E: {ave_E}")
 
         fidelity_history.append(ave_E)
         loss_history.append(losses[-1])
         record_generated_results(all_gen_records, i + 1, gen_op_seq, true_Es)
 
-    plot_result(fidelity_history, 'data_fix_sampling_fidelity', 'data_fix_smapling_fidelity.png')
-    plot_result(loss_history, 'data_fix_sampling_loss', 'data_fix_sampling_loss.png')
-    with open("../myLegacy/result/data_fix_sampling_generated_circuit.json", "w") as f:
+    name = 'data_fix_sampling_SM'
+
+    plot_result(fidelity_history, f'{name}_fidelity', f'{name}_fidelity.png')
+    plot_result(loss_history, f'{name}_loss', f'{name}_loss.png')
+    with open(f"{name}_generated_circuit.json", "w") as f:
         json.dump(all_gen_records, f, indent=2)
+    with open(f"{name}_data_store.pkl", "wb") as f:
+        pickle.dump(data_store, f)

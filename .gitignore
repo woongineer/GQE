@@ -1,6 +1,7 @@
 __pycache__/
 /predefined_layer/results
 *.pyc
+*.json
 *.png
 *.zip
 *.pt
