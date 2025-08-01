@@ -1,6 +1,7 @@
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 import pennylane as qml
+import torch
 
 
 def make_op_pool(gate_type, num_qubit, num_param):
@@ -92,3 +93,33 @@ def record_generated_results(all_records, iteration, gen_op_seq, energies):
             "energy": float(e)
         }
         all_records.append(record)
+
+
+def save_checkpoint(model, optimizer, epoch, mu, sigma, seed, loss_hist, fidelity_hist, records, X1, X2, Y,
+                    path="checkpoint.pt"):
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': epoch,
+        'mu': mu,
+        'sigma': sigma,
+        'seed': seed,
+        'loss_history': loss_hist,
+        'fidelity_history': fidelity_hist,
+        'gen_records': records,
+        'X1': X1.cpu().numpy(),
+        'X2': X2.cpu().numpy(),
+        'Y': Y.cpu().numpy(),
+    }
+    torch.save(checkpoint, path)
+
+
+def load_checkpoint(model, optimizer, path="checkpoint.pt"):
+    checkpoint = torch.load(path, weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    X1 = torch.from_numpy(checkpoint['X1']).float()
+    X2 = torch.from_numpy(checkpoint['X2']).float()
+    Y = torch.from_numpy(checkpoint['Y']).float()
+    return checkpoint['epoch'], checkpoint['mu'], checkpoint['sigma'], checkpoint['seed'], checkpoint['loss_history'], \
+    checkpoint['fidelity_history'], checkpoint['gen_records'], X1, X2, Y

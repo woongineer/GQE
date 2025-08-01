@@ -1,4 +1,3 @@
-import numpy as np
 import tensorflow as tf
 import torch
 from pennylane import numpy as pnp

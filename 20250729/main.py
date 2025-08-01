@@ -1,15 +1,17 @@
 import json
+import os
+import pickle
 from multiprocessing import Pool
 
 import numpy as np
 import pennylane as qml
 import torch
 from torch.nn import functional as F
-import pickle
 
-from NOTUSE.my_legacy_data_fix_py_is_first_hope.data import data_load_and_process, new_data
-from NOTUSE.my_legacy_data_fix_py_is_first_hope.model import GPT, GPTConfig
-from NOTUSE.my_legacy_data_fix_py_is_first_hope.utils import make_op_pool, apply_circuit, select_token_and_en, plot_result, record_generated_results
+from data import data_load_and_process, new_data
+from model import GPT, GPTConfig
+from utils import make_op_pool, apply_circuit, select_token_and_en, plot_result, record_generated_results, \
+    save_checkpoint, load_checkpoint
 
 num_qubit = 4
 dev = qml.device("default.qubit", wires=num_qubit)
@@ -19,8 +21,7 @@ class GPTQE(GPT):
     def forward(self, idx):
         device = idx.device
         b, t = idx.size()
-        pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
-
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
         tok_emb = self.transformer.wte(idx)
         pos_emb = self.transformer.wpe(pos)
         x = self.transformer.drop(tok_emb + pos_emb)
@@ -98,16 +99,23 @@ def temperature(T_max, T_min, max_epoch, epoch):
 if __name__ == '__main__':
     population_size = 1000
     batch_size = 8
-    max_epoch = 20
+    max_epoch = 9
     gate_type = ['RX', 'RY', 'RZ', 'CNOT', 'H', 'I']
     op_pool = make_op_pool(gate_type=gate_type, num_qubit=num_qubit, num_param=num_qubit)
     op_pool_size = len(op_pool)
-    train_size = 32
+    train_size = 16
     n_batches = 8
     max_gate = 20
-    T_max = 1000
-    T_min = 0.01
+    T_max = 10
+    T_min = 0.1
+    name = 'data_fix_sampling_SM'
 
+    # Save & Load
+    resume = True
+    resume_epoch = 5
+    checkpoint_dir = f"{name}_checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_name = f"{name}_checkpoint_{resume_epoch}.pt"
 
     X_train, _, Y_train, _ = data_load_and_process("kmnist", reduction_sz=num_qubit, train_len=population_size)
 
@@ -115,13 +123,28 @@ if __name__ == '__main__':
     opt = gpt.configure_optimizers(weight_decay=0.01, learning_rate=5e-5, betas=(0.9, 0.999), device_type="cpu")
     gpt.train()
 
-    X1, X2, Y, data_store = new_data(batch_size, X_train, Y_train)
-    mu, sigma = None, None
+    # Save & Load
+    if resume:
+        print("Resuming from checkpoint...")
+        checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name)
+        start_epoch, mu, sigma, seed, loss_history, fidelity_history, all_gen_records, X1, X2, Y = \
+            load_checkpoint(gpt, opt, checkpoint_path)
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+    else:
+        start_epoch = 0
+        seed = 42
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        mu, sigma = None, None
+        fidelity_history = []
+        loss_history = []
+        all_gen_records = []
+        X1, X2, Y, data_store = new_data(batch_size, X_train, Y_train)
+        with open(f"{name}_data_store.pkl", "wb") as f:
+            pickle.dump(data_store, f)
 
-    fidelity_history = []
-    loss_history = []
-    all_gen_records = []
-    for i in range(max_epoch):
+    for i in range(start_epoch, max_epoch):
         gpt.eval()
         train_token_seq_torch, _ = gpt.generate(
             n_sequences=train_size * 3,
@@ -163,7 +186,6 @@ if __name__ == '__main__':
             loss_record += loss.item() / n_batches
         losses.append(loss_record)
 
-        # if i == 0 or (i + 1) % 10 == 0:
         gpt.eval()
         gen_token_seq, pred_Es = gpt.generate(
             n_sequences=100,
@@ -188,11 +210,25 @@ if __name__ == '__main__':
         loss_history.append(losses[-1])
         record_generated_results(all_gen_records, i + 1, gen_op_seq, true_Es)
 
-    name = 'data_fix_sampling'
+        # Save & Load
+        checkpoint_path = os.path.join(checkpoint_dir, f"{name}_checkpoint_{i + 1}.pt")
+        save_checkpoint(
+            model=gpt,
+            optimizer=opt,
+            epoch=i + 1,
+            mu=mu,
+            sigma=sigma,
+            seed=seed,
+            loss_hist=loss_history,
+            fidelity_hist=fidelity_history,
+            records=all_gen_records,
+            X1=X1,
+            X2=X2,
+            Y=Y,
+            path=checkpoint_path,
+        )
 
     plot_result(fidelity_history, f'{name}_fidelity', f'{name}_fidelity.png')
     plot_result(loss_history, f'{name}_loss', f'{name}_loss.png')
     with open(f"{name}_generated_circuit.json", "w") as f:
         json.dump(all_gen_records, f, indent=2)
-    with open(f"{name}_data_store.pkl", "wb") as f:
-        pickle.dump(data_store, f)
