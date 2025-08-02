@@ -14,7 +14,7 @@ GQE 헷갈리기 전에 정리
 1. sampling
 2. temperature
 3. save & load 기능
-4. small model(7M, 원래는 85M)
+4. small model(22M, 원래는 85M)
 5. 그리고 이걸 기준으로 지금 서버에서 쓰고 있음.
 
 ## NQE

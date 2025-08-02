@@ -1,5 +1,6 @@
 import json
 import os
+import math
 import pickle
 from multiprocessing import Pool
 
@@ -91,9 +92,19 @@ def normalize_E(E, mu, sigma):
     return (E - mu) / sigma
 
 
-def temperature(T_max, T_min, max_epoch, epoch):
-    ratio = (T_min / T_max) ** (epoch / max_epoch)
-    return T_max * ratio
+def temperature(T_max, T_min, max_epoch, epoch, L0=4000, gamma=0.6):
+    decay = (T_min / T_max) ** (epoch / max_epoch)
+
+    t = 0
+    L = L0
+    while epoch >= t + L:
+        t += L
+        L = max(1, int(L * gamma))
+
+    cos_inner = math.pi * (epoch - t) / L
+    cos_part = 0.5 * (1 + math.cos(cos_inner))
+
+    return T_min + (T_max - T_min) * decay * cos_part
 
 
 if __name__ == '__main__':
@@ -106,9 +117,9 @@ if __name__ == '__main__':
     train_size = 16
     n_batches = 8
     max_gate = 56
-    T_max = 1000
+    T_max = 20
     T_min = 0.04
-    name = 'fix_sample_SM'
+    name = 'fix_sample_SM_temp_schedule'
 
     # Save & Load
     resume = False

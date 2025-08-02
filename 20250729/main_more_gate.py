@@ -10,7 +10,7 @@ from torch.nn import functional as F
 
 from data import data_load_and_process, new_data
 from model import GPT, GPTConfig
-from utils import make_op_pool, apply_circuit, select_token_and_en, plot_result, record_generated_results, \
+from utils import select_token_and_en, plot_result, record_generated_results, \
     save_checkpoint, load_checkpoint
 
 num_qubit = 4
@@ -96,19 +96,73 @@ def temperature(T_max, T_min, max_epoch, epoch):
     return T_max * ratio
 
 
+def make_op_pool(gate_type, num_qubit, num_param, param_scale):
+    op_pool = []
+
+    for gate in gate_type:
+        if gate in ['RX', 'RY', 'RZ']:
+            for q in range(num_qubit):
+                for p in range(num_param):
+                    for s in param_scale:
+                        op_pool.append((gate, (p, s), (q, None)))
+        elif gate in ['H', 'I']:
+            for q in range(num_qubit):
+                op_pool.append((gate, None, (q, None)))
+        elif gate == 'CNOT':
+            for control in range(num_qubit):
+                for target in range(num_qubit):
+                    if control != target:
+                        op_pool.append((gate, None, (control, target)))
+        elif gate == 'MultiRZ':
+            for q1 in range(num_qubit):
+                for q2 in range(q1 + 1, num_qubit):
+                    for p in range(num_param):
+                        for s in param_scale:
+                            op_pool.append((gate, (p, s), (q1, q2)))
+
+    return np.array(op_pool, dtype=object)
+
+
+def apply_circuit(x, circuit):
+    for gate in circuit:
+        apply_gate(gate, x)
+
+
+def apply_gate(gate, x):
+    gate_type, param_idx, qubit_idx = gate
+    ctrl_idx, target_idx = qubit_idx
+
+    # gate 적용
+    if gate_type == 'RX':
+        qml.RX(x[param_idx[0]] * param_idx[1], wires=ctrl_idx)
+    elif gate_type == 'RY':
+        qml.RY(x[param_idx[0]] * param_idx[1], wires=ctrl_idx)
+    elif gate_type == 'RZ':
+        qml.RZ(x[param_idx[0]] * param_idx[1], wires=ctrl_idx)
+    elif gate_type == 'H':
+        qml.Hadamard(wires=ctrl_idx)
+    elif gate_type == 'CNOT':
+        qml.CNOT(wires=[ctrl_idx, target_idx])
+    elif gate_type == 'I':
+        qml.Identity(wires=ctrl_idx)
+    elif gate_type == 'MultiRZ':
+        qml.MultiRZ(x[param_idx[0]] * param_idx[1], wires=[ctrl_idx, target_idx])
+
+
 if __name__ == '__main__':
     population_size = 1000
     batch_size = 8
     max_epoch = 9
-    gate_type = ['RX', 'RY', 'RZ', 'CNOT', 'H', 'I']
-    op_pool = make_op_pool(gate_type=gate_type, num_qubit=num_qubit, num_param=num_qubit)
+    gate_type = ['RX', 'RY', 'RZ', 'CNOT', 'H', 'I', 'MultiRZ']
+    param_scale = [0.1, 0.3, 0.5, 0.7, 1]
+    op_pool = make_op_pool(gate_type=gate_type, num_qubit=num_qubit, num_param=num_qubit, param_scale=param_scale)
     op_pool_size = len(op_pool)
     train_size = 16
     n_batches = 8
     max_gate = 56
     T_max = 1000
     T_min = 0.04
-    name = 'fix_sample_SM'
+    name = 'fix_sample_SM_more_gate'
 
     # Save & Load
     resume = False
