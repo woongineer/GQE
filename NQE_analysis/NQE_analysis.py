@@ -1,6 +1,8 @@
 import json
 import pickle
 import random
+import time
+import os
 from multiprocessing import Pool
 
 import pandas as pd
@@ -156,6 +158,7 @@ def new_data(batch_size, X, Y):
 
 def population_data(train_len=400):
     data_path = "/Users/jwheo/Desktop/Y/NQE/Neural-Quantum-Embedding/rl/kmnist"
+    # data_path = "GQE/kmnist"
     kmnist_train_images_path = f"{data_path}/kmnist-train-imgs.npz"
     kmnist_train_labels_path = f"{data_path}/kmnist-train-labels.npz"
 
@@ -201,8 +204,9 @@ def run_NQE_compare(data_x, data_y, N_layer, batch_size, epoch, good_circuits, b
     loss_lists = {name: [] for name in models.keys()}
     loss_fn = torch.nn.MSELoss()
 
-    for _ in range(epoch):
+    for it in range(epoch):
         X1_batch, X2_batch, Y_batch = new_data(batch_size, data_x, data_y)
+        print(f"Epoch {it + 1}/{epoch}...")
         for name, model in models.items():
             pred = model(X1_batch, X2_batch)
             loss = loss_fn(pred, Y_batch)
@@ -217,6 +221,13 @@ def run_NQE_compare(data_x, data_y, N_layer, batch_size, epoch, good_circuits, b
 
 
 def run_NQE_compare_wrapper(args):
+    """Added to ALTER seed in multiprocessing for server."""
+    seed = int(time.time() * 1e6) % (2**32 - 1) + os.getpid()
+    random.seed(seed)
+    pnp.random.seed(seed)
+    torch.manual_seed(seed)
+
+    print(f"[Worker PID {os.getpid()}] Using seed: {seed}")
     return run_NQE_compare(**args)
 
 
@@ -227,18 +238,18 @@ def run_multiple_NQE_compare(n_repeat, num_workers, **kwargs):
         results = list(tqdm(
             pool.imap(run_NQE_compare_wrapper, task_args),
             total=n_repeat,
-            desc="Running multiple NQE experiments"
+            desc="Running multiple NQE_analysis experiments"
         ))
     return results
 
 
 def get_color(key):
     if key.startswith("G"):
-        return "#4DBBD5"
+        return "#0D28BF"
     elif key.startswith("B"):
         return "red"
     elif key.startswith("R"):
-        return "#00A087"
+        return "#1487B5"
     elif key == "zz":
         return "black"
     else:
@@ -281,3 +292,44 @@ def plot_energy_errorbars(energy_list, html_path="energy_errorbar_plot.html", wi
 
     fig.write_html(html_path)
     print(f"graph save: {html_path}")
+
+
+if __name__ == "__main__":
+    circuit_filename = 'data_fix_sampling_SM_generated_circuit.json'
+    data_filename = 'data_fix_sampling_SM_data_store.pkl'
+    n_circuit = 3
+
+    batch_size = 25
+    N_layer = 1
+    epoch = 8
+    averaging_length = 2
+    num_cpus = 4
+    repeat = 4
+    plot_width = 300
+
+    circuits = get_circuit(circuit_filename)
+    data_x, data_y, _ = get_data(data_filename)
+    # original_x, original_y = population_data(train_len=400)
+
+    good_circuits = get_circuit_by_energy(circuits, 'top', n_circuit=n_circuit)
+    bad_circuits = get_circuit_by_energy(circuits, 'bottom', n_circuit=n_circuit)
+
+    gate_type = ['RX', 'RY', 'RZ', 'CNOT', 'H', 'I']
+    max_gate = 20
+    num_qubits = 4
+
+    rand_circuits = [make_random_circuit(gate_type, max_gate, num_qubits) for _ in range(n_circuit)]
+
+    energy_list = run_multiple_NQE_compare(n_repeat=repeat,
+                                           num_workers=num_cpus,
+                                           data_x=data_x,
+                                           data_y=data_y,
+                                           N_layer=N_layer,
+                                           batch_size=batch_size,
+                                           epoch=epoch,
+                                           good_circuits=good_circuits,
+                                           bad_circuits=bad_circuits,
+                                           rand_circuits=rand_circuits,
+                                           ave_len=averaging_length)
+
+    plot_energy_errorbars(energy_list, html_path="energy_errorbar.html", width=plot_width)
