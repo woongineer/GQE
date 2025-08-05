@@ -1,5 +1,6 @@
 """NQE Analysis code for server environment.
 This code use multithreading property fit to the server specification.
+Somehow I don't know why, but without multithreading, the code stucks...
 """
 import json
 import logging
@@ -311,8 +312,8 @@ def plot_energy_errorbars(energy_list, html_path="energy_errorbar.html", width=2
         xaxis_title="Circuit",
         yaxis_title="Energy",
         xaxis_tickangle=-90,
-        width=width,
-        height=height,
+        # width=width,
+        # height=height,
         template="plotly_white",
         showlegend=True,
     )
