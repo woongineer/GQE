@@ -19,7 +19,7 @@ import torch
 from pennylane import numpy as pnp
 from sklearn.decomposition import PCA
 from torch import nn
-from tqdm import tqdm
+
 
 dev = qml.device('default.qubit', wires=4)
 
@@ -203,7 +203,7 @@ def train_single_model(name, model, X1, X2, Y, opt, loss_fn):
     opt.zero_grad()
     loss.backward()
     opt.step()
-    return name, loss.item()
+    return loss.item()
 
 
 def run_NQE_compare(data_x, data_y, N_layer, batch_size, epoch, good_circuits, bad_circuits, rand_circuits, ave_len):
@@ -235,8 +235,7 @@ def run_NQE_compare(data_x, data_y, N_layer, batch_size, epoch, good_circuits, b
 
         with ThreadPoolExecutor(max_workers=2) as executor:  # 적절히 조절
             futures = [
-                (name,
-                 executor.submit(train_single_model, name, model, X1_batch, X2_batch, Y_batch, opts[name], loss_fn))
+                (name, executor.submit(train_single_model, name, model, X1_batch, X2_batch, Y_batch, opts[name], loss_fn))
                 for name, model in models.items()
             ]
 
@@ -244,7 +243,7 @@ def run_NQE_compare(data_x, data_y, N_layer, batch_size, epoch, good_circuits, b
                 loss_val = future.result()
                 loss_lists[name].append(loss_val)
 
-    final_energy = {name: pnp.mean(energy[-ave_len:]) for name, energy in loss_lists.items()}
+    final_energy = {name: float(pnp.mean(energy[-ave_len:])) for name, energy in loss_lists.items()}
 
     return final_energy
 
@@ -263,11 +262,7 @@ def run_multiple_NQE_compare(n_repeat, num_workers, **kwargs):
     task_args = [kwargs.copy() for _ in range(n_repeat)]
 
     with Pool(processes=num_workers) as pool:
-        results = list(tqdm(
-            pool.imap(run_NQE_compare_wrapper, task_args),
-            total=n_repeat,
-            desc="Running multiple NQE experiments"
-        ))
+        results = list(pool.imap(run_NQE_compare_wrapper, task_args))
     return results
 
 
@@ -367,3 +362,4 @@ if __name__ == "__main__":
     logger.info('NQE finished...')
 
     plot_energy_errorbars(energy_list, html_path=html_filename)
+
