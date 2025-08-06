@@ -1,6 +1,7 @@
-"""NQE Analysis code for server environment.
+"""NQE Analysis code for HPC server environment.
 This code use multithreading property fit to the server specification.
 Somehow I don't know why, but without multithreading, the code stucks...
+This code use multiprocessing with forking, hence faster.
 """
 import json
 import logging
@@ -320,8 +321,8 @@ def plot_energy_errorbars(energy_list, html_path="energy_errorbar.html", width=2
 if __name__ == "__main__":
     logger = setup_logger()
     logger.info("Starting NQE Analysis...")
-    circuit_filename = 'NQE_analysis/data_fix_sampling_SM_generated_circuit.json'
-    data_filename = 'NQE_analysis/data_fix_sampling_SM_data_store.pkl'
+    circuit_filename = 'NQE_analysis_and_circuit_draw/data_fix_sampling_SM_generated_circuit.json'
+    data_filename = 'NQE_analysis_and_circuit_draw/data_fix_sampling_SM_data_store.pkl'
     n_circuit = 50
 
     batch_size = 25
@@ -330,7 +331,7 @@ if __name__ == "__main__":
     averaging_length = 10
     num_cpus = 16
     repeat = 16
-    html_filename = f"NQE_analysis/errorbar_epoch_{epoch}_N_layer_{N_layer}.html"
+    html_filename = f"NQE_analysis_and_circuit_draw/errorbar_epoch_{epoch}_N_layer_{N_layer}.html"
 
     circuits = get_circuit(circuit_filename)
     data_x, data_y, _ = get_data(data_filename)
