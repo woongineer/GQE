@@ -3,7 +3,7 @@ import pandas as pd
 import plotly.graph_objs as go
 import plotly.io as pio
 
-name = "main_temp_schedule"
+name = "main"
 log_path = f"{name}.log"
 
 with open(log_path, "r") as file:

@@ -1,9 +1,6 @@
 """NQE Analysis code for HPC-STAT1 server environment.
 This code use multithreading property fit to the server specification.
-Somehow I don't know why, but without multithreading, the code stucks...
-ALSO, this code use multiprocessing with spawn method.
-If forking(as in NQE_analysis_HPCserver.py) is used, the code will be stuck.
-With forking, in hpc-stat1, some processes are deadlocked.
+Somehow I don't know why, but with multithreading, the code stucks...
 """
 import json
 import logging
@@ -11,8 +8,7 @@ import os
 import pickle
 import random
 import time
-from concurrent.futures import ThreadPoolExecutor
-import multiprocessing as mp
+import os
 from multiprocessing import Pool
 
 import pandas as pd
@@ -24,15 +20,19 @@ from pennylane import numpy as pnp
 from sklearn.decomposition import PCA
 from torch import nn
 
+
 dev = qml.device('default.qubit', wires=4)
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-if not logger.hasHandlers():  # 중복 방지
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter('%(asctime)s | %(process)d | %(levelname)s | %(message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+
+def setup_logger():
+    logger = logging.getLogger()
+    if not logger.hasHandlers():
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s | %(process)d | %(levelname)s | %(message)s',
+            handlers=[logging.StreamHandler()]
+        )
+    return logger
 
 
 def get_circuit(filename):
@@ -66,12 +66,12 @@ def make_random_circuit(gate_type, max_gate, num_qubits):
         gate = random.choice(gate_type)
 
         if gate in ['RX', 'RY', 'RZ']:
-            param_idx = random.randint(0, 3)  # 예: 0~3 사이 임의 파라미터 index
+            param_idx = random.randint(0, 3)
             target = random.randint(0, num_qubits - 1)
             circuit.append([gate, param_idx, [target, None]])
 
         elif gate == 'CNOT':
-            control, target = random.sample(range(num_qubits), 2)  # 서로 다른 두 qubit
+            control, target = random.sample(range(num_qubits), 2)
             circuit.append([gate, None, [control, target]])
 
         elif gate in ['H', 'I']:
@@ -197,16 +197,9 @@ def population_data(train_len=400):
     return x_train[:train_len], y_train[:train_len]
 
 
-def train_single_model(name, model, X1, X2, Y, opt, loss_fn):
-    pred = model(X1, X2)
-    loss = loss_fn(pred, Y)
-    opt.zero_grad()
-    loss.backward()
-    opt.step()
-    return loss.item()
-
-
 def run_NQE_compare(data_x, data_y, N_layer, batch_size, epoch, good_circuits, bad_circuits, rand_circuits, ave_len):
+    logger.info("Running NQE comparison...")
+    logger.info(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
     models = {}
 
     for i in range(len(good_circuits)):
@@ -232,25 +225,22 @@ def run_NQE_compare(data_x, data_y, N_layer, batch_size, epoch, good_circuits, b
     for it in range(epoch):
         X1_batch, X2_batch, Y_batch = new_data(batch_size, data_x, data_y)
         logger.info(f"Epoch {it + 1}/{epoch}...")
+        for name, model in models.items():
+            pred = model(X1_batch, X2_batch)
+            loss = loss_fn(pred, Y_batch)
+            opts[name].zero_grad()
+            loss.backward()
+            opts[name].step()
+            loss_lists[name].append(loss.item())
 
-        with ThreadPoolExecutor(max_workers=2) as executor:  # 적절히 조절
-            futures = [
-                (name,
-                 executor.submit(train_single_model, name, model, X1_batch, X2_batch, Y_batch, opts[name], loss_fn))
-                for name, model in models.items()
-            ]
-
-            for name, future in futures:
-                loss_val = future.result()
-                loss_lists[name].append(loss_val)
-
-    final_energy = {name: float(pnp.mean(energy[-ave_len:])) for name, energy in loss_lists.items()}
+    final_energy = {name: pnp.mean(energy[-ave_len:]) for name, energy in loss_lists.items()}
 
     return final_energy
 
 
 def run_NQE_compare_wrapper(args):
-    seed = int(time.time() * 1e6) % (2 ** 32 - 1) + os.getpid()
+    """Added to ALTER seed in multiprocessing for server."""
+    seed = int(time.time() * 1e6) % (2**32 - 1) + os.getpid()
     random.seed(seed)
     pnp.random.seed(seed)
     torch.manual_seed(seed)
@@ -280,7 +270,7 @@ def get_color(key):
         return "gray"
 
 
-def plot_energy_errorbars(energy_list, html_path="energy_errorbar.html", width=2000, height=600, filter_keys=None):
+def plot_energy_errorbars(energy_list, html_path="energy_errorbar_plot.html", width=2000, height=600, filter_keys=None):
     df = pd.DataFrame(energy_list)
 
     if filter_keys is not None:
@@ -319,11 +309,10 @@ def plot_energy_errorbars(energy_list, html_path="energy_errorbar.html", width=2
 
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
-
+    logger = setup_logger()
     logger.info("Starting NQE Analysis...")
-    circuit_filename = 'NQE_analysis_and_circuit_draw/data_fix_sampling_SM_generated_circuit.json'
-    data_filename = 'NQE_analysis_and_circuit_draw/data_fix_sampling_SM_data_store.pkl'
+    circuit_filename = 'NQE_analysis/data_fix_sampling_SM_generated_circuit.json'
+    data_filename = 'NQE_analysis/data_fix_sampling_SM_data_store.pkl'
     n_circuit = 50
 
     batch_size = 25
@@ -332,7 +321,7 @@ if __name__ == "__main__":
     averaging_length = 10
     num_cpus = 16
     repeat = 16
-    html_filename = f"NQE_analysis_and_circuit_draw/errorbar_epoch_{epoch}_N_layer_{N_layer}.html"
+    html_filename = f"NQE_analysis/errorbar_epoch_{epoch}_N_layer_{N_layer}.html"
 
     circuits = get_circuit(circuit_filename)
     data_x, data_y, _ = get_data(data_filename)
@@ -364,4 +353,5 @@ if __name__ == "__main__":
     logger.info('NQE finished...')
 
     plot_energy_errorbars(energy_list, html_path=html_filename)
+
 
