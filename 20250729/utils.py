@@ -12,6 +12,11 @@ def make_op_pool(gate_type, num_qubit, num_param):
             for q in range(num_qubit):
                 for p in range(num_param):
                     op_pool.append((gate, p, (q, None)))
+        elif gate == 'MultiRZ':
+            for q1 in range(num_qubit):
+                for q2 in range(q1 + 1, num_qubit):
+                    for p in range(num_param):
+                        op_pool.append((gate, p, (q1, q2)))
         elif gate in ['H', 'I']:
             for q in range(num_qubit):
                 op_pool.append((gate, None, (q, None)))
