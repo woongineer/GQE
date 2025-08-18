@@ -21,7 +21,6 @@ from pennylane import numpy as pnp
 from sklearn.decomposition import PCA
 from torch import nn
 
-
 dev = qml.device('default.qubit', wires=4)
 
 
@@ -61,23 +60,34 @@ def get_circuit_by_energy(data, top_or_bottom, n_circuit):
     return rm_duple[:n_circuit]
 
 
-def make_random_circuit(gate_type, max_gate, num_qubits):
+def make_random_circuit(with_scale, gate_type, max_gate, num_qubits, scales):
     circuit = []
     for _ in range(max_gate):
         gate = random.choice(gate_type)
 
-        if gate in ['RX', 'RY', 'RZ']:
-            param_idx = random.randint(0, 3)  # 예: 0~3 사이 임의 파라미터 index
-            target = random.randint(0, num_qubits - 1)
-            circuit.append([gate, param_idx, [target, None]])
-
-        elif gate == 'CNOT':
-            control, target = random.sample(range(num_qubits), 2)  # 서로 다른 두 qubit
-            circuit.append([gate, None, [control, target]])
-
-        elif gate in ['H', 'I']:
+        if gate in ['H', 'I']:
             target = random.randint(0, num_qubits - 1)
             circuit.append([gate, None, [target, None]])
+
+        elif gate == 'CNOT':
+            control, target = random.sample(range(num_qubits), 2)
+            circuit.append([gate, None, [control, target]])
+
+        elif gate in ['RX', 'RY', 'RZ']:
+            param_idx = random.randint(0, num_qubits - 1)
+            target = random.randint(0, num_qubits - 1)
+            if with_scale:
+                scale = random.choice(scales)
+                param_idx = [param_idx, scale]
+            circuit.append([gate, param_idx, [target, None]])
+
+        elif gate == 'MultiRZ':
+            param_idx = random.randint(0, num_qubits - 1)
+            control, target = random.sample(range(num_qubits), 2)
+            if with_scale:
+                scale = random.choice(scales)
+                param_idx = [param_idx, scale]
+            circuit.append([gate, param_idx, [control, target]])
 
     return circuit
 
@@ -103,7 +113,7 @@ def get_ZZEmbedding(N_layers):
     return ZZEmbedding
 
 
-def build_circuit(gate_seq=None, N_layers=None):
+def build_circuit(gate_seq=None, with_scale=False, N_layers=None):
     ZZEmbedding = get_ZZEmbedding(N_layers) if gate_seq is None else None
 
     @qml.qnode(dev, interface="torch")
@@ -112,26 +122,33 @@ def build_circuit(gate_seq=None, N_layers=None):
             ZZEmbedding(inputs[0:4])
             qml.adjoint(lambda: ZZEmbedding(inputs[4:8]))()
         else:
-            apply_structure(gate_seq, inputs[0:4])
-            qml.adjoint(lambda: apply_structure(gate_seq, inputs[4:8]))()
+            apply_structure(gate_seq, with_scale, inputs[0:4])
+            qml.adjoint(lambda: apply_structure(gate_seq, with_scale, inputs[4:8]))()
         return qml.probs(wires=range(4))
 
     return circuit
 
 
-def apply_structure(gate_seq, x):
-    for gate_name, target, param_indices in gate_seq:
-        if gate_name == "CNOT":
-            qml.CNOT(wires=param_indices)
-        else:
-            param_idx = param_indices[0]
-            angle = x[param_idx] if param_idx is not None else 0.0
-            if gate_name == "RX":
-                qml.RX(angle, wires=target)
-            elif gate_name == "RY":
-                qml.RY(angle, wires=target)
-            elif gate_name == "RZ":
-                qml.RZ(angle, wires=target)
+def apply_structure(gate_seq, with_scale, x):
+    for gate_name, param, wires in gate_seq:
+        if gate_name == "H":
+            qml.Hadamard(wires=wires[0])
+        elif gate_name == "I":
+            qml.Identity(wires=wires[0])
+        elif gate_name == "CNOT":
+            qml.CNOT(wires=wires)  # [control, target]
+        elif gate_name == "RX":
+            theta = x[param[0]] * param[1] if with_scale else x[param]
+            qml.RX(theta, wires=wires[0])
+        elif gate_name == "RY":
+            theta = x[param[0]] * param[1] if with_scale else x[param]
+            qml.RY(theta, wires=wires[0])
+        elif gate_name == "RZ":
+            theta = x[param[0]] * param[1] if with_scale else x[param]
+            qml.RZ(theta, wires=wires[0])
+        elif gate_name == "MultiRZ":
+            theta = x[param[0]] * param[1] if with_scale else x[param]
+            qml.MultiRZ(theta, wires=wires)  # [w1, w2, ...]
 
 
 class Model_Fidelity(torch.nn.Module):
@@ -198,7 +215,7 @@ def population_data(train_len=400):
     return x_train[:train_len], y_train[:train_len]
 
 
-def train_single_model(name, model, X1, X2, Y, opt, loss_fn):
+def train_single_model(model, X1, X2, Y, opt, loss_fn):
     pred = model(X1, X2)
     loss = loss_fn(pred, Y)
     opt.zero_grad()
@@ -207,21 +224,23 @@ def train_single_model(name, model, X1, X2, Y, opt, loss_fn):
     return loss.item()
 
 
-def run_NQE_compare(data_x, data_y, N_layer, batch_size, epoch, good_circuits, bad_circuits, rand_circuits, ave_len):
+def run_NQE_compare(data_x, data_y, with_scale, N_layer, batch_size, epoch, good_circuits, bad_circuits, rand_circuits, ave_len):
+    logger.info("Running NQE comparison...")
+    logger.info(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
     models = {}
 
     for i in range(len(good_circuits)):
         gate_seq = good_circuits.iloc[i]['gen_op_seq']
-        circuit = build_circuit(gate_seq)
+        circuit = build_circuit(gate_seq=gate_seq, with_scale=with_scale)
         models[f"G{i + 1}"] = Model_Fidelity(circuit)
 
     for i in range(len(bad_circuits)):
         gate_seq = bad_circuits.iloc[i]['gen_op_seq']
-        circuit = build_circuit(gate_seq)
+        circuit = build_circuit(gate_seq=gate_seq, with_scale=with_scale)
         models[f"B{i + 1}"] = Model_Fidelity(circuit)
 
     for i in range(len(rand_circuits)):
-        circuit = build_circuit(rand_circuits[i])
+        circuit = build_circuit(gate_seq=rand_circuits[i], with_scale=with_scale)
         models[f"R{i + 1}"] = Model_Fidelity(circuit)
 
     models["zz"] = Model_Fidelity(build_circuit(N_layers=N_layer))
@@ -236,7 +255,7 @@ def run_NQE_compare(data_x, data_y, N_layer, batch_size, epoch, good_circuits, b
 
         with ThreadPoolExecutor(max_workers=2) as executor:  # 적절히 조절
             futures = [
-                (name, executor.submit(train_single_model, name, model, X1_batch, X2_batch, Y_batch, opts[name], loss_fn))
+                (name, executor.submit(train_single_model, model, X1_batch, X2_batch, Y_batch, opts[name], loss_fn))
                 for name, model in models.items()
             ]
 
@@ -321,10 +340,11 @@ def plot_energy_errorbars(energy_list, html_path="energy_errorbar.html", width=2
 if __name__ == "__main__":
     logger = setup_logger()
     logger.info("Starting NQE Analysis...")
-    circuit_filename = 'NQE_analysis_and_circuit_draw/data_fix_sampling_SM_generated_circuit.json'
-    data_filename = 'NQE_analysis_and_circuit_draw/data_fix_sampling_SM_data_store.pkl'
-    n_circuit = 50
+    circuit_filename = 'NQE_analysis_and_circuit_draw/fix_sample_SM_more_gate_generated_circuit.json'
+    data_filename = 'NQE_analysis_and_circuit_draw/fix_sample_SM_more_gate_data_store.pkl'
+    with_scale = True
 
+    n_circuit = 50
     batch_size = 25
     N_layer = 1
     epoch = 100
@@ -333,6 +353,11 @@ if __name__ == "__main__":
     repeat = 16
     html_filename = f"NQE_analysis_and_circuit_draw/errorbar_epoch_{epoch}_N_layer_{N_layer}.html"
 
+    gate_type = ['RX', 'RY', 'RZ', 'CNOT', 'H', 'I']
+    max_gate = 20
+    num_qubits = 4
+    scales = [0.1, 0.3, 0.5, 0.7, 1]
+
     circuits = get_circuit(circuit_filename)
     data_x, data_y, _ = get_data(data_filename)
     # original_x, original_y = population_data(train_len=400)
@@ -340,11 +365,7 @@ if __name__ == "__main__":
     good_circuits = get_circuit_by_energy(circuits, 'top', n_circuit=n_circuit)
     bad_circuits = get_circuit_by_energy(circuits, 'bottom', n_circuit=n_circuit)
 
-    gate_type = ['RX', 'RY', 'RZ', 'CNOT', 'H', 'I']
-    max_gate = 20
-    num_qubits = 4
-
-    rand_circuits = [make_random_circuit(gate_type, max_gate, num_qubits) for _ in range(n_circuit)]
+    rand_circuits = [make_random_circuit(with_scale, gate_type, max_gate, num_qubits, scales) for _ in range(n_circuit)]
 
     logger.info('NQE begin...')
 
@@ -352,6 +373,7 @@ if __name__ == "__main__":
                                            num_workers=num_cpus,
                                            data_x=data_x,
                                            data_y=data_y,
+                                           with_scale=with_scale,
                                            N_layer=N_layer,
                                            batch_size=batch_size,
                                            epoch=epoch,
@@ -363,4 +385,3 @@ if __name__ == "__main__":
     logger.info('NQE finished...')
 
     plot_energy_errorbars(energy_list, html_path=html_filename)
-
