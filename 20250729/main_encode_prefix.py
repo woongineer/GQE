@@ -1,6 +1,5 @@
 import json
 import os
-import pickle
 from multiprocessing import Pool
 
 import numpy as np
@@ -16,24 +15,47 @@ from utils import make_op_pool, apply_circuit, select_token_and_en, plot_result,
 num_qubit = 4
 dev = qml.device("default.qubit", wires=num_qubit)
 
+PREFIX_LEN = 8
 
 class GPTQE(GPT):
-    def forward(self, idx):
+    def __init__(self, config: GPTConfig):
+        super().__init__(config)
+        self.prefix_fc = torch.nn.Linear(2 * num_qubit, self.config.n_embd)
+
+    # (X1, X2) 배치에서 평균을 내고 -> 임베딩으로 사상 -> PREFIX_LEN만큼 반복
+    def build_prefix(self, X1_np: np.ndarray, X2_np: np.ndarray, device: str = "cpu") -> torch.Tensor:
+        X1 = torch.as_tensor(X1_np, dtype=torch.float32, device=device)  # (B, q)
+        X2 = torch.as_tensor(X2_np, dtype=torch.float32, device=device)  # (B, q)
+        z = torch.cat([X1, X2], dim=1).mean(dim=0, keepdim=True)        # (1, 2q)
+        e = self.prefix_fc(z)                                           # (1, d)
+        prefix = e.unsqueeze(1).repeat(1, PREFIX_LEN, 1)                # (1, Lp, d)
+        return prefix
+
+    def forward(self, idx, prefix_emb: torch.Tensor):
         device = idx.device
         b, t = idx.size()
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        Lp = PREFIX_LEN
+
         tok_emb = self.transformer.wte(idx)
+        pos = torch.arange(0, Lp + t, dtype=torch.long, device=device)
         pos_emb = self.transformer.wpe(pos)
-        x = self.transformer.drop(tok_emb + pos_emb)
+
+        x_prefix = prefix_emb + pos_emb[:Lp].unsqueeze(0)         # (B, Lp, d)
+        x_tokens = tok_emb + pos_emb[Lp:].unsqueeze(0)            # (B, T, d)
+        x = torch.cat((x_prefix, x_tokens), dim=1)                # (B, Lp+T, d)
+
+        x = self.transformer.drop(x)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         return logits
 
-    def calculate_loss(self, tokens, energies):
+    def calculate_loss(self, tokens, energies, prefix_emb: torch.Tensor):
         current_tokens, next_tokens = tokens[:, :-1], tokens[:, 1:]
-        logits = self(current_tokens)
+        logits = self(current_tokens, prefix_emb=prefix_emb)       # (B, Lp+T-1, V)
+        logits = logits[:, PREFIX_LEN:, :]                  # (B, T-1, V)  # prefix 제거
+
         next_token_mask = torch.nn.functional.one_hot(next_tokens, num_classes=self.config.vocab_size)
         next_token_logits = (logits * next_token_mask).sum(axis=2)
         total_logits = torch.sum(next_token_logits, dim=1)
@@ -41,13 +63,16 @@ class GPTQE(GPT):
         return loss
 
     @torch.no_grad()
-    def generate(self, n_sequences, max_new_tokens, temperature=1.0, device="cpu"):
+    def generate(self, n_sequences, max_new_tokens, temperature=1.0, device="cpu", prefix_emb: torch.Tensor = None):
         idx = torch.zeros(size=(n_sequences, 1), dtype=int, device=device)
         total_energy = torch.zeros((n_sequences, 1), device=device)
 
+        prefix_emb = prefix_emb.repeat(n_sequences, 1, 1)
         for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            logits = self(idx_cond)
+            max_tok_ctx = self.config.block_size - PREFIX_LEN
+            idx_cond = idx if idx.size(1) <= max_tok_ctx else idx[:, -max_tok_ctx:]
+
+            logits = self(idx_cond, prefix_emb=prefix_emb)
             logits = logits[:, -1, :]
             logits[:, 0] = float("inf")
 
@@ -119,7 +144,7 @@ if __name__ == '__main__':
 
     X_train, _, Y_train, _ = data_load_and_process("kmnist", reduction_sz=num_qubit, train_len=population_size)
 
-    gpt = GPTQE(GPTConfig(vocab_size=op_pool_size + 1, block_size=max_gate, dropout=0.2, bias=False))
+    gpt = GPTQE(GPTConfig(vocab_size=op_pool_size + 1, block_size=max_gate + PREFIX_LEN, dropout=0.2, bias=False))
     opt = gpt.configure_optimizers(weight_decay=0.01, learning_rate=5e-5, betas=(0.9, 0.999), device_type="cpu")
     gpt.train()
 
@@ -140,17 +165,18 @@ if __name__ == '__main__':
         fidelity_history = []
         loss_history = []
         all_gen_records = []
-        X1, X2, Y, data_store = new_data(batch_size, X_train, Y_train)
-        with open(f"{name}_data_store.pkl", "wb") as f:
-            pickle.dump(data_store, f)
 
     for i in range(start_epoch, max_epoch):
+        X1, X2, Y, data_store = new_data(batch_size, X_train, Y_train)
+        prefix_epoch = gpt.build_prefix(X1, X2, device="cpu")
+
         gpt.eval()
         train_token_seq_torch, _ = gpt.generate(
             n_sequences=train_size * 3,
             max_new_tokens=max_gate,
             temperature=temperature(T_max=T_max, T_min=T_min, max_epoch=max_epoch, epoch=i),
             device="cpu",
+            prefix_emb=prefix_epoch,
         )
         gpt.train()
         train_token_seq = train_token_seq_torch.numpy()
@@ -180,7 +206,8 @@ if __name__ == '__main__':
         losses = []
         for token_batch, energy_batch in zip(token_batches, energy_batches):
             opt.zero_grad()
-            loss = gpt.calculate_loss(token_batch, energy_batch)
+            prefix_for_batch = prefix_epoch.repeat(token_batch.size(0), 1, 1)
+            loss = gpt.calculate_loss(token_batch, energy_batch, prefix_emb=prefix_for_batch)
             loss.backward()
             opt.step()
             loss_record += loss.item() / n_batches
@@ -192,6 +219,7 @@ if __name__ == '__main__':
             max_new_tokens=max_gate,
             temperature=0.01,
             device="cpu",
+            prefix_emb=prefix_epoch
         )
         pred_Es = pred_Es.numpy()
         print(gen_token_seq[0])
