@@ -1,7 +1,6 @@
-"""NQE Analysis code for HPC server environment.
+"""NQE Analysis code for HPC-STAT1 server environment.
 This code use multithreading property fit to the server specification.
-Somehow I don't know why, but without multithreading, the code stucks...
-This code use multiprocessing with forking, hence faster.
+Somehow I don't know why, but with multithreading, the code stucks...
 """
 import json
 import logging
@@ -9,29 +8,31 @@ import os
 import pickle
 import random
 import time
-from concurrent.futures import ThreadPoolExecutor
-from multiprocessing import Pool
+from multiprocessing import get_context
 
 import pandas as pd
 import pennylane as qml
 import plotly.graph_objects as go
-import tensorflow as tf
+# import tensorflow as tf
 import torch
 from pennylane import numpy as pnp
 from sklearn.decomposition import PCA
 from torch import nn
 
-dev = qml.device('default.qubit', wires=4)
+
+logger = logging.getLogger("nqe")
 
 
 def setup_logger():
-    logger = logging.getLogger()
-    if not logger.hasHandlers():
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s | %(process)d | %(levelname)s | %(message)s',
-            handlers=[logging.StreamHandler()]
+    global logger
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            '%(asctime)s | %(process)d | %(levelname)s | %(message)s'
         )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
     return logger
 
 
@@ -114,6 +115,7 @@ def get_ZZEmbedding(N_layers):
 
 
 def build_circuit(gate_seq=None, with_scale=False, N_layers=None):
+    dev = qml.device('default.qubit', wires=4)
     ZZEmbedding = get_ZZEmbedding(N_layers) if gate_seq is None else None
 
     @qml.qnode(dev, interface="torch")
@@ -191,37 +193,28 @@ def new_data(batch_size, X, Y):
     return X1_new, X2_new, Y_new
 
 
-def population_data(train_len=400):
-    data_path = "GQE/kmnist"
-    kmnist_train_images_path = f"{data_path}/kmnist-train-imgs.npz"
-    kmnist_train_labels_path = f"{data_path}/kmnist-train-labels.npz"
+# def population_data(train_len=400):
+#     data_path = "GQE/kmnist"
+#     kmnist_train_images_path = f"{data_path}/kmnist-train-imgs.npz"
+#     kmnist_train_labels_path = f"{data_path}/kmnist-train-labels.npz"
 
-    x_train = pnp.load(kmnist_train_images_path)["arr_0"]
-    y_train = pnp.load(kmnist_train_labels_path)["arr_0"]
+#     x_train = pnp.load(kmnist_train_images_path)["arr_0"]
+#     y_train = pnp.load(kmnist_train_labels_path)["arr_0"]
 
-    x_train = x_train[..., pnp.newaxis] / 255.0
-    train_filter_tf = pnp.where((y_train == 0) | (y_train == 1))
+#     x_train = x_train[..., pnp.newaxis] / 255.0
+#     train_filter_tf = pnp.where((y_train == 0) | (y_train == 1))
 
-    x_train, y_train = x_train[train_filter_tf], y_train[train_filter_tf]
+#     x_train, y_train = x_train[train_filter_tf], y_train[train_filter_tf]
 
-    x_train = tf.image.resize(x_train[:], (256, 1)).numpy()
-    x_train = tf.squeeze(x_train).numpy()
+#     x_train = tf.image.resize(x_train[:], (256, 1)).numpy()
+#     x_train = tf.squeeze(x_train).numpy()
 
-    X_train = PCA(4).fit_transform(x_train)
-    x_train = []
-    for x in X_train:
-        x = (x - x.min()) * (2 * pnp.pi / (x.max() - x.min()))
-        x_train.append(x)
-    return x_train[:train_len], y_train[:train_len]
-
-
-def train_single_model(model, X1, X2, Y, opt, loss_fn):
-    pred = model(X1, X2)
-    loss = loss_fn(pred, Y)
-    opt.zero_grad()
-    loss.backward()
-    opt.step()
-    return loss.item()
+#     X_train = PCA(4).fit_transform(x_train)
+#     x_train = []
+#     for x in X_train:
+#         x = (x - x.min()) * (2 * pnp.pi / (x.max() - x.min()))
+#         x_train.append(x)
+#     return x_train[:train_len], y_train[:train_len]
 
 
 def run_NQE_compare(data_x, data_y, with_scale, N_layer, batch_size, epoch, good_circuits, bad_circuits, rand_circuits, ave_len):
@@ -252,23 +245,22 @@ def run_NQE_compare(data_x, data_y, with_scale, N_layer, batch_size, epoch, good
     for it in range(epoch):
         X1_batch, X2_batch, Y_batch = new_data(batch_size, data_x, data_y)
         logger.info(f"Epoch {it + 1}/{epoch}...")
+        for name, model in models.items():
+            pred = model(X1_batch, X2_batch)
+            loss = loss_fn(pred, Y_batch)
+            opts[name].zero_grad()
+            loss.backward()
+            opts[name].step()
+            loss_lists[name].append(loss.item())
 
-        with ThreadPoolExecutor(max_workers=2) as executor:  # 적절히 조절
-            futures = [
-                (name, executor.submit(train_single_model, model, X1_batch, X2_batch, Y_batch, opts[name], loss_fn))
-                for name, model in models.items()
-            ]
-
-            for name, future in futures:
-                loss_val = future.result()
-                loss_lists[name].append(loss_val)
-
-    final_energy = {name: float(pnp.mean(energy[-ave_len:])) for name, energy in loss_lists.items()}
+    final_energy = {name: pnp.mean(energy[-ave_len:]) for name, energy in loss_lists.items()}
 
     return final_energy
 
 
 def run_NQE_compare_wrapper(args):
+    logger = setup_logger()
+    torch.set_num_threads(1)
     seed = int(time.time() * 1e6) % (2 ** 32 - 1) + os.getpid()
     random.seed(seed)
     pnp.random.seed(seed)
@@ -281,8 +273,9 @@ def run_NQE_compare_wrapper(args):
 def run_multiple_NQE_compare(n_repeat, num_workers, **kwargs):
     task_args = [kwargs.copy() for _ in range(n_repeat)]
 
-    with Pool(processes=num_workers) as pool:
-        results = list(pool.imap(run_NQE_compare_wrapper, task_args))
+    ctx = get_context("spawn")
+    with ctx.Pool(processes=num_workers, maxtasksperchild=1) as pool:
+        results = list(pool.imap(run_NQE_compare_wrapper, task_args, chunksize=1))
     return results
 
 
@@ -340,8 +333,18 @@ def plot_energy_errorbars(energy_list, html_path="energy_errorbar.html", width=2
 if __name__ == "__main__":
     logger = setup_logger()
     logger.info("Starting NQE Analysis...")
-    circuit_filename = 'NQE_analysis_and_circuit_draw/fix_sample_SM_more_gate_generated_circuit.json'
-    data_filename = 'NQE_analysis_and_circuit_draw/fix_sample_SM_more_gate_data_store.pkl'
+
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+    os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+    torch.set_num_threads(1)
+
+    circuit_filename = 'NQE_analysis/fix_sample_SM_more_gate_generated_circuit.json'
+    data_filename = 'NQE_analysis/fix_sample_SM_more_gate_data_store.pkl'
     with_scale = True
 
     n_circuit = 50
@@ -351,7 +354,7 @@ if __name__ == "__main__":
     averaging_length = 10
     num_cpus = 16
     repeat = 16
-    html_filename = f"NQE_analysis_and_circuit_draw/errorbar_epoch_{epoch}_N_layer_{N_layer}.html"
+    html_filename = f"NQE_analysis/errorbar_epoch_{epoch}_N_layer_{N_layer}.html"
 
     gate_type = ['RX', 'RY', 'RZ', 'CNOT', 'H', 'I']
     max_gate = 20
