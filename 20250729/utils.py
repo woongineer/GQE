@@ -73,7 +73,7 @@ def select_token_and_en(train_token_seq, train_seq_en, train_size):
     new_train_token_seq = train_token_seq[final_indices]
     new_train_seq_en = train_seq_en[final_indices]
 
-    return new_train_token_seq, new_train_seq_en
+    return new_train_token_seq, new_train_seq_en, final_indices
 
 
 def plot_result(data, title, filename):

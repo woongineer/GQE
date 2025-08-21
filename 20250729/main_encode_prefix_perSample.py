@@ -1,7 +1,5 @@
 import json
 import os
-import math
-import pickle
 from multiprocessing import Pool
 
 import numpy as np
@@ -19,22 +17,42 @@ dev = qml.device("default.qubit", wires=num_qubit)
 
 
 class GPTQE(GPT):
-    def forward(self, idx):
+    def __init__(self, config: GPTConfig):
+        super().__init__(config)
+        self.prefix_fc = torch.nn.Linear(2 * num_qubit, self.config.n_embd)
+
+    def build_prefix(self, X1_np: np.ndarray, X2_np: np.ndarray, device: str = "cpu") -> torch.Tensor:
+        X1 = torch.as_tensor(X1_np, dtype=torch.float32, device=device)
+        X2 = torch.as_tensor(X2_np, dtype=torch.float32, device=device)
+        z = torch.cat([X1, X2], dim=1)
+        e = self.prefix_fc(z)
+        prefix = e.unsqueeze(1).repeat(1, self.prefix_len, 1)
+        return prefix
+
+    def forward(self, idx, prefix_emb: torch.Tensor):
         device = idx.device
         b, t = idx.size()
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
+
         tok_emb = self.transformer.wte(idx)
+        pos = torch.arange(0, self.prefix_len + t, dtype=torch.long, device=device)
         pos_emb = self.transformer.wpe(pos)
-        x = self.transformer.drop(tok_emb + pos_emb)
+
+        x_prefix = prefix_emb + pos_emb[:self.prefix_len].unsqueeze(0)
+        x_tokens = tok_emb + pos_emb[self.prefix_len:].unsqueeze(0)
+        x = torch.cat((x_prefix, x_tokens), dim=1)
+
+        x = self.transformer.drop(x)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         return logits
 
-    def calculate_loss(self, tokens, energies):
+    def calculate_loss(self, tokens, energies, prefix_emb: torch.Tensor):
         current_tokens, next_tokens = tokens[:, :-1], tokens[:, 1:]
-        logits = self(current_tokens)
+        logits = self(current_tokens, prefix_emb=prefix_emb)
+        logits = logits[:, self.prefix_len:, :]
+
         next_token_mask = torch.nn.functional.one_hot(next_tokens, num_classes=self.config.vocab_size)
         next_token_logits = (logits * next_token_mask).sum(axis=2)
         total_logits = torch.sum(next_token_logits, dim=1)
@@ -42,13 +60,15 @@ class GPTQE(GPT):
         return loss
 
     @torch.no_grad()
-    def generate(self, n_sequences, max_new_tokens, temperature=1.0, device="cpu"):
-        idx = torch.zeros(size=(n_sequences, 1), dtype=int, device=device)
+    def generate(self, n_sequences, max_new_tokens, temperature=1.0, device="cpu", prefix_emb: torch.Tensor = None):
+        idx = torch.zeros(size=(n_sequences, 1), dtype=torch.long, device=device)
         total_energy = torch.zeros((n_sequences, 1), device=device)
 
         for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            logits = self(idx_cond)
+            max_tok_ctx = self.config.block_size - self.prefix_len
+            idx_cond = idx if idx.size(1) <= max_tok_ctx else idx[:, -max_tok_ctx:]
+
+            logits = self(idx_cond, prefix_emb=prefix_emb)
             logits = logits[:, -1, :]
             logits[:, 0] = float("inf")
 
@@ -73,17 +93,13 @@ def fidelity_circuit(x1, x2, circuit):
 
 def compute_energy_for_ops(ops_and_data):
     ops, X1, X2, Y = ops_and_data
-    energy_per_seq = []
-    for single_x1, single_x2, single_y in zip(X1, X2, Y):
-        probs = fidelity_circuit(single_x1, single_x2, ops)
-        es = abs(probs[0] - single_y)
-        energy_per_seq.append(es.item())
-    return np.mean(energy_per_seq)
+    probs = fidelity_circuit(X1, X2, ops)
+    return float(abs(probs[0] - Y))
 
 
-def get_sequence_energies(op_seq, X1, X2, Y, num_workers=4):
+def get_sequence_energies(op_seq, X1, X2, Y, sample_indices, num_workers=4):
+    inputs = [(ops, X1[i], X2[i], Y[i]) for ops, i in zip(op_seq, sample_indices)]
     with Pool(processes=num_workers) as pool:
-        inputs = [(ops, X1, X2, Y) for ops in op_seq]
         energies = pool.map(compute_energy_for_ops, inputs)
     return np.array(energies, dtype=np.float32).reshape(-1, 1)
 
@@ -92,19 +108,9 @@ def normalize_E(E, mu, sigma):
     return (E - mu) / sigma
 
 
-def temperature(T_max, T_min, max_epoch, epoch, L0=4000, gamma=0.6):
-    decay = (T_min / T_max) ** (epoch / max_epoch)
-
-    t = 0
-    L = L0
-    while epoch >= t + L:
-        t += L
-        L = max(1, int(L * gamma))
-
-    cos_inner = math.pi * (epoch - t) / L
-    cos_part = 0.5 * (1 + math.cos(cos_inner))
-
-    return T_min + (T_max - T_min) * decay * cos_part
+def temperature(T_max, T_min, max_epoch, epoch):
+    ratio = (T_min / T_max) ** (epoch / max_epoch)
+    return T_max * ratio
 
 
 if __name__ == '__main__':
@@ -117,9 +123,10 @@ if __name__ == '__main__':
     train_size = 16
     n_batches = 8
     max_gate = 56
-    T_max = 20
+    T_max = 1000
     T_min = 0.04
-    name = 'fix_sample_SM_temp_schedule'
+    prefix_len = 8
+    name = 'main_encode_prefix'
 
     # Save & Load
     resume = False
@@ -130,7 +137,8 @@ if __name__ == '__main__':
 
     X_train, _, Y_train, _ = data_load_and_process("kmnist", reduction_sz=num_qubit, train_len=population_size)
 
-    gpt = GPTQE(GPTConfig(vocab_size=op_pool_size + 1, block_size=max_gate, dropout=0.2, bias=False))
+    gpt = GPTQE(GPTConfig(vocab_size=op_pool_size + 1, block_size=max_gate + prefix_len, dropout=0.2, bias=False))
+    gpt.prefix_len = prefix_len
     opt = gpt.configure_optimizers(weight_decay=0.01, learning_rate=5e-5, betas=(0.9, 0.999), device_type="cpu")
     gpt.train()
 
@@ -151,24 +159,32 @@ if __name__ == '__main__':
         fidelity_history = []
         loss_history = []
         all_gen_records = []
-        X1, X2, Y, data_store = new_data(batch_size, X_train, Y_train)
-        with open(f"{name}_data_store.pkl", "wb") as f:
-            pickle.dump(data_store, f)
 
     for i in range(start_epoch, max_epoch):
+        X1, X2, Y, data_store = new_data(batch_size, X_train, Y_train)
+
+        prefix_batch = gpt.build_prefix(X1, X2, device="cpu")
+
+        S_total = train_size * 3
+        S_ps = max(1, S_total // batch_size)
+        n_gen = S_ps * batch_size
+        prefix_for_gen = prefix_batch.detach().repeat_interleave(S_ps, dim=0)
+
         gpt.eval()
         train_token_seq_torch, _ = gpt.generate(
-            n_sequences=train_size * 3,
+            n_sequences=n_gen,
             max_new_tokens=max_gate,
             temperature=temperature(T_max=T_max, T_min=T_min, max_epoch=max_epoch, epoch=i),
             device="cpu",
+            prefix_emb=prefix_for_gen,
         )
         gpt.train()
         train_token_seq = train_token_seq_torch.numpy()
         train_op_inds = train_token_seq[:, 1:] - 1
         train_op_seq = op_pool[train_op_inds]
 
-        train_seq_en = get_sequence_energies(train_op_seq, X1, X2, Y)
+        sample_indices = np.repeat(np.arange(batch_size), S_ps)
+        train_seq_en = get_sequence_energies(train_op_seq, X1, X2, Y, sample_indices)
 
         alpha = 0.1
         if mu is None:
@@ -179,38 +195,48 @@ if __name__ == '__main__':
         print(f"[scale] μ={mu:.6f}, σ={sigma:.6f}")
         train_seq_en = normalize_E(train_seq_en, mu, sigma)
 
-        train_token_seq, train_seq_en, _ = select_token_and_en(train_token_seq, train_seq_en, train_size)
+        train_token_seq, train_seq_en, sel_idx = select_token_and_en(train_token_seq, train_seq_en, train_size)
+        sel_sample_idx = sample_indices[sel_idx]
 
         tokens = torch.from_numpy(train_token_seq)
         energies = torch.from_numpy(train_seq_en)
-        train_inds = np.arange(train_size)
-        token_batches = torch.tensor_split(tokens[train_inds], n_batches)
-        energy_batches = torch.tensor_split(energies[train_inds], n_batches)
+        sel_sample_idx_t = torch.from_numpy(sel_sample_idx.astype(np.int64))
+
+        token_batches = torch.tensor_split(tokens, n_batches)
+        energy_batches = torch.tensor_split(energies, n_batches)
+        sample_idx_batches = torch.tensor_split(sel_sample_idx_t, n_batches)
 
         loss_record = 0
         losses = []
-        for token_batch, energy_batch in zip(token_batches, energy_batches):
+        for token_batch, energy_batch, si_batch in zip(token_batches, energy_batches, sample_idx_batches):
             opt.zero_grad()
-            loss = gpt.calculate_loss(token_batch, energy_batch)
+            prefix_for_batch = gpt.build_prefix(X1[si_batch.numpy()], X2[si_batch.numpy()], device="cpu")
+            loss = gpt.calculate_loss(token_batch, energy_batch, prefix_emb=prefix_for_batch)
             loss.backward()
             opt.step()
             loss_record += loss.item() / n_batches
         losses.append(loss_record)
 
         gpt.eval()
+        S_eval_total = 100
+        S_eval = max(1, S_eval_total // batch_size)
+        n_eval = S_eval * batch_size
+        prefix_for_eval = prefix_batch.detach().repeat_interleave(S_eval, dim=0)
+
         gen_token_seq, pred_Es = gpt.generate(
-            n_sequences=100,
+            n_sequences=n_eval,
             max_new_tokens=max_gate,
             temperature=0.01,
-            device="cpu"
+            device="cpu",
+            prefix_emb=prefix_for_eval
         )
         pred_Es = pred_Es.numpy()
         print(gen_token_seq[0])
 
         gen_inds = (gen_token_seq[:, 1:] - 1).numpy()
         gen_op_seq = op_pool[gen_inds]
-        true_Es = get_sequence_energies(gen_op_seq, X1, X2, Y)
-        true_Es_norm = normalize_E(true_Es, mu, sigma)
+        sample_indices_eval = np.repeat(np.arange(batch_size), S_eval)
+        true_Es = get_sequence_energies(gen_op_seq, X1, X2, Y, sample_indices_eval)
 
         ave_pred_E = np.mean(pred_Es)
         ave_E = np.mean(true_Es)

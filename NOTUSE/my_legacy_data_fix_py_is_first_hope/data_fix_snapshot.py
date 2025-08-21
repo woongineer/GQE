@@ -133,7 +133,7 @@ if __name__ == '__main__':
             print(f"[scale] μ={mu:.6f}, σ={sigma:.6f}")
         train_seq_en = normalize_E(train_seq_en, mu, sigma)
 
-        train_token_seq, train_seq_en = select_token_and_en(train_token_seq, train_seq_en, train_size)
+        train_token_seq, train_seq_en, _ = select_token_and_en(train_token_seq, train_seq_en, train_size)
 
         tokens = torch.from_numpy(train_token_seq)
         energies = torch.from_numpy(train_seq_en)

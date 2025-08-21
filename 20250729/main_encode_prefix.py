@@ -21,13 +21,12 @@ class GPTQE(GPT):
         super().__init__(config)
         self.prefix_fc = torch.nn.Linear(2 * num_qubit, self.config.n_embd)
 
-    # (X1, X2) 배치에서 평균을 내고 -> 임베딩으로 사상 -> PREFIX_LEN만큼 반복
     def build_prefix(self, X1_np: np.ndarray, X2_np: np.ndarray, device: str = "cpu") -> torch.Tensor:
-        X1 = torch.as_tensor(X1_np, dtype=torch.float32, device=device)  # (B, q)
-        X2 = torch.as_tensor(X2_np, dtype=torch.float32, device=device)  # (B, q)
-        z = torch.cat([X1, X2], dim=1).mean(dim=0, keepdim=True)        # (1, 2q)
-        e = self.prefix_fc(z)                                           # (1, d)
-        prefix = e.unsqueeze(1).repeat(1, self.prefix_len, 1)                # (1, Lp, d)
+        X1 = torch.as_tensor(X1_np, dtype=torch.float32, device=device)
+        X2 = torch.as_tensor(X2_np, dtype=torch.float32, device=device)
+        z = torch.cat([X1, X2], dim=1).mean(dim=0, keepdim=True)
+        e = self.prefix_fc(z)
+        prefix = e.unsqueeze(1).repeat(1, self.prefix_len, 1)
         return prefix
 
     def forward(self, idx, prefix_emb: torch.Tensor):
@@ -38,9 +37,9 @@ class GPTQE(GPT):
         pos = torch.arange(0, self.prefix_len + t, dtype=torch.long, device=device)
         pos_emb = self.transformer.wpe(pos)
 
-        x_prefix = prefix_emb + pos_emb[:self.prefix_len].unsqueeze(0)         # (B, Lp, d)
-        x_tokens = tok_emb + pos_emb[self.prefix_len:].unsqueeze(0)            # (B, T, d)
-        x = torch.cat((x_prefix, x_tokens), dim=1)                # (B, Lp+T, d)
+        x_prefix = prefix_emb + pos_emb[:self.prefix_len].unsqueeze(0)
+        x_tokens = tok_emb + pos_emb[self.prefix_len:].unsqueeze(0)
+        x = torch.cat((x_prefix, x_tokens), dim=1)
 
         x = self.transformer.drop(x)
         for block in self.transformer.h:
@@ -51,8 +50,8 @@ class GPTQE(GPT):
 
     def calculate_loss(self, tokens, energies, prefix_emb: torch.Tensor):
         current_tokens, next_tokens = tokens[:, :-1], tokens[:, 1:]
-        logits = self(current_tokens, prefix_emb=prefix_emb)       # (B, Lp+T-1, V)
-        logits = logits[:, self.prefix_len:, :]                  # (B, T-1, V)  # prefix 제거
+        logits = self(current_tokens, prefix_emb=prefix_emb)
+        logits = logits[:, self.prefix_len:, :]
 
         next_token_mask = torch.nn.functional.one_hot(next_tokens, num_classes=self.config.vocab_size)
         next_token_logits = (logits * next_token_mask).sum(axis=2)
@@ -195,7 +194,7 @@ if __name__ == '__main__':
         print(f"[scale] μ={mu:.6f}, σ={sigma:.6f}")
         train_seq_en = normalize_E(train_seq_en, mu, sigma)
 
-        train_token_seq, train_seq_en = select_token_and_en(train_token_seq, train_seq_en, train_size)
+        train_token_seq, train_seq_en, _ = select_token_and_en(train_token_seq, train_seq_en, train_size)
 
         tokens = torch.from_numpy(train_token_seq)
         energies = torch.from_numpy(train_seq_en)
