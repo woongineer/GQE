@@ -3,8 +3,8 @@ import pandas as pd
 import plotly.graph_objs as go
 import plotly.io as pio
 
-checkpoint_path = "fix_sample_SM_temp_schedule_checkpoint_8000.pt"
-output_name = "main_temp_schedule"
+checkpoint_path = "28_main_more_gate_checkpoint_7100.pt"
+output_name = "main_more"
 window = 50
 
 ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)

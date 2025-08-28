@@ -3,7 +3,7 @@ import pandas as pd
 import plotly.graph_objs as go
 import plotly.io as pio
 
-name = "main"
+name = "main_more_gate"
 log_path = f"{name}.log"
 
 with open(log_path, "r") as file:
@@ -40,7 +40,7 @@ fig.update_layout(
     template='plotly_white'
 )
 
-html_output_path = f"{name}_ave_true_e_plot.html"
+html_output_path = f"{name}_fidelity.html"
 pio.write_html(fig, file=html_output_path, auto_open=False)
 
 print(f"graph saved")

@@ -343,18 +343,18 @@ if __name__ == "__main__":
     os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
     torch.set_num_threads(1)
 
-    circuit_filename = 'NQE_analysis/fix_sample_SM_more_gate_generated_circuit.json'
-    data_filename = 'NQE_analysis/fix_sample_SM_more_gate_data_store.pkl'
+    circuit_filename = 'fix_sample_SM_more_gate_generated_circuit.json'
+    data_filename = 'fix_sample_SM_more_gate_data_store.pkl'
     with_scale = True
 
-    n_circuit = 50
+    n_circuit = 3
     batch_size = 25
     N_layer = 1
-    epoch = 100
-    averaging_length = 10
-    num_cpus = 16
-    repeat = 16
-    html_filename = f"NQE_analysis/errorbar_epoch_{epoch}_N_layer_{N_layer}.html"
+    epoch = 7
+    averaging_length = 2
+    num_cpus = 2
+    repeat = 2
+    html_filename = f"errorbar_epoch_{epoch}_N_layer_{N_layer}.html"
 
     gate_type = ['RX', 'RY', 'RZ', 'CNOT', 'H', 'I']
     max_gate = 20
