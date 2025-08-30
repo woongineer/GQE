@@ -13,7 +13,7 @@ from multiprocessing import get_context
 import plotly.graph_objects as go
 from torch import nn, optim
 
-logger = logging.getLogger("nqe")
+logger = logging.getLogger("prefactor")
 
 
 def setup_logger():
@@ -197,7 +197,7 @@ def plot_energy_errorbars(energy_list, html_path="energy_errorbar.html", width=2
         ))
 
     fig.update_layout(
-        title="NQEed Energy per Circuit (Mean ± Std)",
+        title="Prefactored Energy per Circuit (Mean ± Std)",
         xaxis_title="Circuit",
         yaxis_title="Energy",
         xaxis_tickangle=-90,
@@ -371,6 +371,15 @@ def build_zz_qnode_with_bias(num_qubits, n_layers):
 if __name__ == "__main__":
     logger = setup_logger()
     logger.info("Starting prefactor analysis...")
+
+    # os.environ.setdefault("OMP_NUM_THREADS", "1")
+    # os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    # os.environ.setdefault("MKL_NUM_THREADS", "1")
+    # os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+    # os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    # os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+    # os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+    # torch.set_num_threads(1)
 
     circuit_filename = 'fix_sample_SM_more_gate_generated_circuit.json'
     data_filename = 'fix_sample_SM_more_gate_data_store.pkl'
