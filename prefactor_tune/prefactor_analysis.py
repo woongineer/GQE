@@ -1,20 +1,23 @@
 import json
-import pickle
 import logging
-import pandas as pd
 import os
-import time
-import pennylane as qml
+import pickle
 import random
-from numpy import pi
-import torch
-from pennylane import numpy as pnp
+import time
 from multiprocessing import get_context
+
+import pandas as pd
+import pennylane as qml
 import plotly.graph_objects as go
+import torch
+from numpy import pi
+from pennylane import numpy as pnp
 from torch import nn, optim
 
 logger = logging.getLogger("prefactor")
 
+
+########################## util functions ##########################
 
 def setup_logger():
     global logger
@@ -100,64 +103,7 @@ def make_random_circuit(gate_type, max_gate, num_qubits, scales):
     return circuit
 
 
-class BiasNet(nn.Module):
-    def __init__(self, num_of_bias, num_of_feature):
-        super().__init__()
-        self.x_stack = nn.Sequential(
-            nn.Linear(num_of_feature, num_of_feature * 2), nn.ReLU(),
-            nn.Linear(num_of_feature * 2, num_of_feature * 2), nn.ReLU(),
-            nn.Linear(num_of_feature * 2, num_of_feature),
-        )
-        self.bias_head = nn.Sequential(
-            nn.Linear(num_of_feature * 2, num_of_feature * 4), nn.ReLU(),
-            nn.Linear(num_of_feature * 4, num_of_bias),
-        )
-
-    def forward(self, x1, x2):
-        x1 = self.x_stack(x1)
-        x2 = self.x_stack(x2)
-        x = torch.cat([x1, x2], dim=1)
-        return self.bias_head(x)
-
-
-def apply_structure(gate_seq, x, bias):
-    bias_count = 0
-    for gate_name, param, wires in gate_seq:
-        if gate_name == "H":
-            qml.Hadamard(wires=wires[0])
-        elif gate_name == "I":
-            qml.Identity(wires=wires[0])
-        elif gate_name == "CNOT":
-            qml.CNOT(wires=wires)
-        elif gate_name in ["RX", "RY", "RZ", "MultiRZ"]:
-            theta = x[param[0]] * param[1] + bias[bias_count]
-            bias_count += 1
-            if gate_name == "RX":
-                qml.RX(theta, wires=wires[0])
-            elif gate_name == "RY":
-                qml.RY(theta, wires=wires[0])
-            elif gate_name == "RZ":
-                qml.RZ(theta, wires=wires[0])
-            elif gate_name == "MultiRZ":
-                qml.MultiRZ(theta, wires=wires)
-    assert bias_count == len(bias), "bias length mismatch"
-
-
-def build_qnode_with_bias(num_qubits, gate_seq):
-    dev = qml.device("default.qubit", wires=num_qubits)
-
-    @qml.qnode(dev, interface="torch")
-    def qnode(packed):
-        # packed = [x1(4), x2(4), bias(num_bias)]
-        x1 = packed[:4]
-        x2 = packed[4:8]
-        bias = packed[8:]
-
-        apply_structure(gate_seq, x1, bias)
-        qml.adjoint(lambda: apply_structure(gate_seq, x2, bias))()
-        return qml.probs(wires=range(num_qubits))
-
-    return qnode
+########################## Graph ##########################
 
 
 def get_color(key):
@@ -169,6 +115,8 @@ def get_color(key):
         return "#1487B5"
     elif key == "zz":
         return "black"
+    elif key == "zz_nqe":
+        return "#2E7D32"
     else:
         return "gray"
 
@@ -233,6 +181,8 @@ def plot_epoch_trajectories(trace_dict, html_path="epoch_trajectories.html",
     logger.info(f"trajectory graph save: {html_path}")
 
 
+########################## Runner ##########################
+
 def run_multiple_compare(n_repeat, num_workers, **kwargs):
     task_args = [kwargs.copy() for _ in range(n_repeat)]
 
@@ -254,7 +204,8 @@ def run_compare_wrapper(args):
     return run_compare(**args)
 
 
-def run_compare(data_x, data_y, num_qubits, n_layer, batch_size, epoch, good_circuits, bad_circuits, rand_circuits, ave_len):
+def run_compare(data_x, data_y, num_qubits, n_layer, batch_size, epoch, good_circuits, bad_circuits, rand_circuits,
+                ave_len):
     logger.info("Running comparison...")
     logger.info(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
 
@@ -267,7 +218,7 @@ def run_compare(data_x, data_y, num_qubits, n_layer, batch_size, epoch, good_cir
         name = f"G{i + 1}"
 
         nets[name] = BiasNet(num_of_bias=num_of_bias, num_of_feature=num_qubits)
-        opts[name] = optim.SGD(nets[name].parameters(), lr=0.01)
+        opts[name] = optim.SGD(nets[name].parameters(), lr=0.001)
         qnodes[name] = build_qnode_with_bias(num_qubits, gate_seq)
 
     for i in range(len(bad_circuits)):
@@ -276,7 +227,7 @@ def run_compare(data_x, data_y, num_qubits, n_layer, batch_size, epoch, good_cir
         name = f"B{i + 1}"
 
         nets[name] = BiasNet(num_of_bias=num_of_bias, num_of_feature=num_qubits)
-        opts[name] = optim.SGD(nets[name].parameters(), lr=0.01)
+        opts[name] = optim.SGD(nets[name].parameters(), lr=0.001)
         qnodes[name] = build_qnode_with_bias(num_qubits, gate_seq)
 
     for i in range(len(rand_circuits)):
@@ -285,13 +236,17 @@ def run_compare(data_x, data_y, num_qubits, n_layer, batch_size, epoch, good_cir
         name = f"R{i + 1}"
 
         nets[name] = BiasNet(num_of_bias=num_of_bias, num_of_feature=num_qubits)
-        opts[name] = optim.SGD(nets[name].parameters(), lr=0.01)
+        opts[name] = optim.SGD(nets[name].parameters(), lr=0.001)
         qnodes[name] = build_qnode_with_bias(num_qubits, gate_seq)
 
     zz_bias_num = count_param_gates_zz(n_layer)
     nets["zz"] = BiasNet(num_of_bias=zz_bias_num, num_of_feature=num_qubits)
-    opts["zz"] = optim.SGD(nets["zz"].parameters(), lr=0.01)
+    opts["zz"] = optim.SGD(nets["zz"].parameters(), lr=0.001)
     qnodes["zz"] = build_zz_qnode_with_bias(num_qubits, n_layer)
+
+    nets["zz_nqe"] = EncoderNet(num_of_feature=num_qubits)
+    opts["zz_nqe"] = optim.SGD(nets["zz_nqe"].parameters(), lr=0.001)
+    qnodes["zz_nqe"] = build_zz_qnode_nqe(num_qubits, n_layer)
 
     loss_lists = {name: [] for name in nets.keys()}
     loss_fn = torch.nn.MSELoss()
@@ -301,15 +256,21 @@ def run_compare(data_x, data_y, num_qubits, n_layer, batch_size, epoch, good_cir
         logger.info(f"Epoch {it + 1}/{epoch}...")
         for name, model in nets.items():
             opts[name].zero_grad()
-            bias = nets[name](X1_batch, X2_batch)
-
-            preds = []
-            for i in range(batch_size):
-                packed = torch.cat([X1_batch[i], X2_batch[i], bias[i]], dim=0)
-                probs = qnodes[name](packed)
-                preds.append(probs[0])
-
-            preds = torch.stack(preds).float()
+            if name == "zz_nqe":
+                packed8 = nets[name](X1_batch, X2_batch)
+                preds = []
+                for i in range(batch_size):
+                    probs = qnodes[name](packed8[i])
+                    preds.append(probs[0])
+                preds = torch.stack(preds).float()
+            else:
+                bias = nets[name](X1_batch, X2_batch)
+                preds = []
+                for i in range(batch_size):
+                    packed = torch.cat([X1_batch[i], X2_batch[i], bias[i]], dim=0)
+                    probs = qnodes[name](packed)
+                    preds.append(probs[0])
+                preds = torch.stack(preds).float()
             loss = loss_fn(preds, Y_batch)
             loss.backward()
             opts[name].step()
@@ -318,6 +279,70 @@ def run_compare(data_x, data_y, num_qubits, n_layer, batch_size, epoch, good_cir
     final_energy = {name: pnp.mean(energy[-ave_len:]) for name, energy in loss_lists.items()}
 
     return {"final": final_energy, "trace": loss_lists}
+
+
+########################## Bias Network ##########################
+
+class BiasNet(nn.Module):
+    def __init__(self, num_of_bias, num_of_feature):
+        super().__init__()
+        self.feat = nn.Sequential(
+            nn.Linear(num_of_feature, num_of_feature * 4), nn.ReLU(),
+            nn.Linear(num_of_feature * 4, num_of_feature * 2), nn.ReLU(),
+        )
+        self.head = nn.Linear(num_of_feature * 2, num_of_bias, bias=True)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, x1, x2):
+        x1 = self.feat(x1)
+        x2 = self.feat(x2)
+        b1 = self.head(x1)
+        b2 = self.head(x2)
+        return torch.cat([b1, b2], dim=1)
+
+
+def apply_structure(gate_seq, x, bias):
+    bias_count = 0
+    for gate_name, param, wires in gate_seq:
+        if gate_name == "H":
+            qml.Hadamard(wires=wires[0])
+        elif gate_name == "I":
+            qml.Identity(wires=wires[0])
+        elif gate_name == "CNOT":
+            qml.CNOT(wires=wires)
+        elif gate_name in ["RX", "RY", "RZ", "MultiRZ"]:
+            theta = x[param[0]] * param[1] + bias[bias_count]
+            bias_count += 1
+            if gate_name == "RX":
+                qml.RX(theta, wires=wires[0])
+            elif gate_name == "RY":
+                qml.RY(theta, wires=wires[0])
+            elif gate_name == "RZ":
+                qml.RZ(theta, wires=wires[0])
+            elif gate_name == "MultiRZ":
+                qml.MultiRZ(theta, wires=wires)
+    assert bias_count == len(bias), "bias length mismatch"
+
+
+def build_qnode_with_bias(num_qubits, gate_seq):
+    dev = qml.device("default.qubit", wires=num_qubits)
+
+    @qml.qnode(dev, interface="torch")
+    def qnode(packed):
+        # packed = [x1(4), x2(4), b1(L), b2(L)]
+        x1 = packed[:4]
+        x2 = packed[4:8]
+        bcat = packed[8:]
+        L = bcat.shape[0] // 2
+        b1 = bcat[:L]
+        b2 = bcat[L:]
+
+        apply_structure(gate_seq, x1, b1)
+        qml.adjoint(lambda: apply_structure(gate_seq, x2, b2))()
+        return qml.probs(wires=range(num_qubits))
+
+    return qnode
 
 
 #########################for zz circuit#########################
@@ -359,10 +384,57 @@ def build_zz_qnode_with_bias(num_qubits, n_layers):
     def qnode(packed):
         x1 = packed[:4]
         x2 = packed[4:8]
-        bias = packed[8:]
+        bcat = packed[8:]
+        L = bcat.shape[0] // 2
+        b1 = bcat[:L]
+        b2 = bcat[L:]
 
-        apply_zz_with_bias(n_layers, x1, bias)
-        qml.adjoint(lambda: apply_zz_with_bias(n_layers, x2, bias))()
+        apply_zz_with_bias(n_layers, x1, b1)
+        qml.adjoint(lambda: apply_zz_with_bias(n_layers, x2, b2))()
+        return qml.probs(wires=range(num_qubits))
+
+    return qnode
+
+
+class EncoderNet(nn.Module):
+    def __init__(self, num_of_feature):
+        super().__init__()
+        self.enc = nn.Sequential(
+            nn.Linear(num_of_feature, num_of_feature * 2), nn.ReLU(),
+            nn.Linear(num_of_feature * 2, num_of_feature * 2), nn.ReLU(),
+            nn.Linear(num_of_feature * 2, num_of_feature),
+        )
+
+    def forward(self, x1, x2):
+        z1 = self.enc(x1)
+        z2 = self.enc(x2)
+        return torch.cat([z1, z2], dim=1)
+
+
+def apply_zz_no_bias(n_layers, x):
+    for _ in range(n_layers):
+        for j in range(4):
+            qml.Hadamard(wires=j)
+            qml.RZ(-2.0 * x[j], wires=j)
+        for k in range(3):
+            qml.CNOT(wires=[k, k + 1])
+            qml.RZ(-2.0 * ((pi - x[k]) * (pi - x[k + 1])), wires=k + 1)
+            qml.CNOT(wires=[k, k + 1])
+        qml.CNOT(wires=[3, 0])
+        qml.RZ(-2.0 * ((pi - x[3]) * (pi - x[0])), wires=0)
+        qml.CNOT(wires=[3, 0])
+
+
+def build_zz_qnode_nqe(num_qubits, n_layers):
+    dev = qml.device("default.qubit", wires=num_qubits)
+
+    @qml.qnode(dev, interface="torch")
+    def qnode(packed8):
+        # packed8 = [z1(4), z2(4)] ; bias 없음
+        z1 = packed8[:4]
+        z2 = packed8[4:8]
+        apply_zz_no_bias(n_layers, z1)
+        qml.adjoint(lambda: apply_zz_no_bias(n_layers, z2))()
         return qml.probs(wires=range(num_qubits))
 
     return qnode
@@ -381,20 +453,23 @@ if __name__ == "__main__":
     # os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
     # torch.set_num_threads(1)
 
-    circuit_filename = 'fix_sample_SM_more_gate_generated_circuit.json'
-    data_filename = 'fix_sample_SM_more_gate_data_store.pkl'
+    # circuit_filename = 'prefactor_tune/28_main_more_gate_generated_circuit.json'
+    # data_filename = 'prefactor_tune/28_main_more_gate_data_store.pkl'
+    circuit_filename = '28_main_more_gate_generated_circuit.json'
+    data_filename = '28_main_more_gate_data_store.pkl'
 
-    n_circuit = 3
+    n_circuit = 3  # 50
     batch_size = 25
     n_layer = 1
-    epoch = 7
-    averaging_length = 2
-    num_cpus = 2
-    repeat = 2
-    html_filename = f"errorbar_epoch_{epoch}.html"
+    epoch = 6  # 100
+    averaging_length = 2  # 10
+    num_cpus = 2  # 16
+    repeat = 2  # 16
+    # html_filename = f"prefactor_tune/indept_add_epoch{epoch}"
+    html_filename = f"epoch{epoch}"
 
     gate_type = ['RX', 'RY', 'RZ', 'CNOT', 'H', 'I']
-    max_gate = 20
+    max_gate = 28
     num_qubits = 4
     scales = [0.1, 0.3, 0.5, 0.7, 1]
 
@@ -423,9 +498,9 @@ if __name__ == "__main__":
     logger.info('Analysis finished...')
 
     energy_list = [res["final"] for res in results]
-    plot_energy_errorbars(energy_list, html_path=html_filename)
+    plot_energy_errorbars(energy_list, html_path=f"{html_filename}_errorbar.html")
 
     trace_repeat_idx = 0
     plot_epoch_trajectories(results[trace_repeat_idx]["trace"],
-                            html_path=f"epoch_traj_repeat_{trace_repeat_idx}.html",
+                            html_path=f"{html_filename}_trajectory.html",
                             title=f"Energy vs Epoch (repeat {trace_repeat_idx})")
