@@ -517,13 +517,13 @@ if __name__ == "__main__":
     circuit_filename = '28_main_more_gate_generated_circuit.json'
     data_filename = '28_main_more_gate_data_store.pkl'
 
-    n_circuit = 3  # 50
     batch_size = 25
     n_layer = 1
+    n_circuit = 3  # 50
     epoch = 10  # 100
     averaging_length = 2  # 10
     num_cpus = 2  # 16
-    repeat = 2  # 16
+    repeat = num_cpus
     # html_filename = f"prefactor_tune/indept_add_epoch{epoch}"
     html_filename = f"epoch{epoch}"
 
