@@ -181,6 +181,65 @@ def plot_epoch_trajectories(trace_dict, html_path="epoch_trajectories.html",
     logger.info(f"trajectory graph save: {html_path}")
 
 
+def plot_initial_final_arrows(trace_dict, html_path="init_final_arrows.html",
+                              ave_len=1, filter_keys=None,
+                              title="Init → Final Energy (per model)"):
+    """
+    trace_dict: {model_name: [energy_at_epoch1, energy_at_epoch2, ...]}
+    ave_len: 최종값을 마지막 ave_len 개 평균으로 안정화 (기본 1 = 마지막 한 점)
+    """
+    fig = go.Figure()
+    keys = list(trace_dict.keys()) if filter_keys is None else filter_keys
+    xs = list(range(len(keys)))  # 카테고리 x좌표 (ticktext로 레이블 표시)
+
+    # X축에 모델 이름 라벨
+    fig.update_xaxes(tickmode="array", tickvals=xs, ticktext=keys)
+
+    for i, name in enumerate(keys):
+        ys = trace_dict[name]
+        if len(ys) == 0:
+            continue
+
+        # 초기값: 첫 기록 (현재 루프 구조상 bias=0 시점)
+        y0 = float(ys[0])
+        # 최종값: 마지막 ave_len개 평균
+        L = max(1, min(ave_len, len(ys)))
+        y1 = float(pnp.mean(ys[-L:]))
+
+        base = get_color(name)
+
+        # 초기(X) 마커
+        fig.add_trace(go.Scatter(
+            x=[xs[i]], y=[y0], mode="markers",
+            marker=dict(symbol="x", size=7, line=dict(width=1, color=base), color=base),
+            name=f"{name} (init)"
+        ))
+        # 최종(dot) 마커
+        fig.add_trace(go.Scatter(
+            x=[xs[i]], y=[y1], mode="markers",
+            marker=dict(symbol="circle", size=5, color=base),
+            name=f"{name} (final)"
+        ))
+
+        # 화살표(초기→최종)
+        fig.add_annotation(
+            x=xs[i], y=y1, ax=xs[i], ay=y0,
+            xref="x", yref="y", axref="x", ayref="y",
+            showarrow=True, arrowhead=3, arrowwidth=1.5,
+            arrowcolor=base, opacity=0.6
+        )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Model",
+        yaxis_title="Energy",
+        template="plotly_white",
+        showlegend=True,
+    )
+    fig.write_html(html_path)
+    logger.info(f"graph save: {html_path}")
+
+
 ########################## Runner ##########################
 
 def run_multiple_compare(n_repeat, num_workers, **kwargs):
@@ -461,7 +520,7 @@ if __name__ == "__main__":
     n_circuit = 3  # 50
     batch_size = 25
     n_layer = 1
-    epoch = 6  # 100
+    epoch = 10  # 100
     averaging_length = 2  # 10
     num_cpus = 2  # 16
     repeat = 2  # 16
@@ -502,5 +561,6 @@ if __name__ == "__main__":
 
     trace_repeat_idx = 0
     plot_epoch_trajectories(results[trace_repeat_idx]["trace"],
-                            html_path=f"{html_filename}_trajectory.html",
-                            title=f"Energy vs Epoch (repeat {trace_repeat_idx})")
+                            html_path=f"{html_filename}_trajectory.html", title=f"Energy vs Epoch")
+    plot_initial_final_arrows(results[trace_repeat_idx]["trace"], html_path=f"{html_filename}_arrow.html",
+                              ave_len=averaging_length, title=f"Init(X) → Final(O) Energy")
