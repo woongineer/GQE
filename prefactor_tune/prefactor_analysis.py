@@ -17,6 +17,13 @@ from torch import nn, optim
 logger = logging.getLogger("prefactor")
 
 
+BIAS_GAIN = 10.0
+P_EPS = 1e-6
+GRAD_CLIP_NORM = 2.0
+BIAS_L2_LAMBDA = 1e-6
+
+
+
 ########################## util functions ##########################
 
 def setup_logger():
@@ -121,7 +128,7 @@ def get_color(key):
         return "gray"
 
 
-def plot_energy_errorbars(energy_list, html_path="energy_errorbar.html", filter_keys=None):
+def plot_energy_errorbars(energy_list, html_path="energy_errorbar.html", width=2000, height=600, filter_keys=None):
     df = pd.DataFrame(energy_list)
 
     if filter_keys is not None:
@@ -149,6 +156,8 @@ def plot_energy_errorbars(energy_list, html_path="energy_errorbar.html", filter_
         xaxis_title="Circuit",
         yaxis_title="Energy",
         xaxis_tickangle=-90,
+        # width=width,
+        # height=height,
         template="plotly_white",
         showlegend=True,
     )
@@ -183,6 +192,7 @@ def plot_initial_final_arrows(trace_dict, html_path="init_final_arrows.html",
     keys = list(trace_dict.keys()) if filter_keys is None else filter_keys
     xs = list(range(len(keys)))
 
+    # X축에 모델 이름 라벨
     fig.update_xaxes(tickmode="array", tickvals=xs, ticktext=keys)
 
     for i, name in enumerate(keys):
@@ -206,7 +216,6 @@ def plot_initial_final_arrows(trace_dict, html_path="init_final_arrows.html",
             marker=dict(symbol="circle", size=5, color=base),
             name=f"{name} (final)"
         ))
-
         fig.add_annotation(
             x=xs[i], y=y1, ax=xs[i], ay=y0,
             xref="x", yref="y", axref="x", ayref="y",
@@ -262,7 +271,7 @@ def run_compare(data_x, data_y, num_qubits, n_layer, batch_size, epoch, good_cir
         name = f"G{i + 1}"
 
         nets[name] = BiasNet(num_of_bias=num_of_bias, num_of_feature=num_qubits)
-        opts[name] = optim.SGD(nets[name].parameters(), lr=0.001)
+        opts[name] = optim.RMSprop(nets[name].parameters(), lr=0.0005, alpha=0.99, eps=1e-6, weight_decay=0.0)
         qnodes[name] = build_qnode_with_bias(num_qubits, gate_seq)
 
     for i in range(len(bad_circuits)):
@@ -271,7 +280,7 @@ def run_compare(data_x, data_y, num_qubits, n_layer, batch_size, epoch, good_cir
         name = f"B{i + 1}"
 
         nets[name] = BiasNet(num_of_bias=num_of_bias, num_of_feature=num_qubits)
-        opts[name] = optim.SGD(nets[name].parameters(), lr=0.001)
+        opts[name] = optim.RMSprop(nets[name].parameters(), lr=0.0005, alpha=0.99, eps=1e-6, weight_decay=0.0)
         qnodes[name] = build_qnode_with_bias(num_qubits, gate_seq)
 
     for i in range(len(rand_circuits)):
@@ -280,20 +289,21 @@ def run_compare(data_x, data_y, num_qubits, n_layer, batch_size, epoch, good_cir
         name = f"R{i + 1}"
 
         nets[name] = BiasNet(num_of_bias=num_of_bias, num_of_feature=num_qubits)
-        opts[name] = optim.SGD(nets[name].parameters(), lr=0.001)
+        opts[name] = optim.RMSprop(nets[name].parameters(), lr=0.0005, alpha=0.99, eps=1e-6, weight_decay=0.0)
         qnodes[name] = build_qnode_with_bias(num_qubits, gate_seq)
 
     zz_bias_num = count_param_gates_zz(n_layer)
     nets["zz"] = BiasNet(num_of_bias=zz_bias_num, num_of_feature=num_qubits)
-    opts["zz"] = optim.SGD(nets["zz"].parameters(), lr=0.001)
+    opts["zz"] = optim.RMSprop(nets["zz"].parameters(), lr=0.0005, alpha=0.99, eps=1e-6, weight_decay=0.0)
     qnodes["zz"] = build_zz_qnode_with_bias(num_qubits, n_layer)
 
     nets["zz_nqe"] = EncoderNet(num_of_feature=num_qubits)
-    opts["zz_nqe"] = optim.SGD(nets["zz_nqe"].parameters(), lr=0.001)
+    opts["zz_nqe"] = optim.RMSprop(nets["zz_nqe"].parameters(), lr=0.0005, alpha=0.99, eps=1e-6, weight_decay=0.0)
     qnodes["zz_nqe"] = build_zz_qnode_nqe(num_qubits, n_layer)
 
     loss_lists = {name: [] for name in nets.keys()}
-    loss_fn = torch.nn.MSELoss()
+
+    loss_fn = torch.nn.BCELoss()
 
     for it in range(epoch):
         X1_batch, X2_batch, Y_batch = new_data(batch_size, data_x, data_y)
@@ -301,24 +311,47 @@ def run_compare(data_x, data_y, num_qubits, n_layer, batch_size, epoch, good_cir
         for name, model in nets.items():
             opts[name].zero_grad()
             if name == "zz_nqe":
+                # encoder 기반 (bias 없음)
                 packed8 = nets[name](X1_batch, X2_batch)
                 preds = []
                 for i in range(batch_size):
                     probs = qnodes[name](packed8[i])
                     preds.append(probs[0])
                 preds = torch.stack(preds).float()
+
+                preds = preds.clamp(P_EPS, 1.0 - P_EPS)
+                bce_loss = loss_fn(preds, Y_batch)
+                mse_metric = ((preds - Y_batch) ** 2).mean()
+
+                bce_loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_NORM)
+
+                opts[name].step()
+                loss_lists[name].append(float(mse_metric.item()))
             else:
                 bias = nets[name](X1_batch, X2_batch)
+                bias = BIAS_GAIN * bias
+
                 preds = []
                 for i in range(batch_size):
                     packed = torch.cat([X1_batch[i], X2_batch[i], bias[i]], dim=0)
                     probs = qnodes[name](packed)
                     preds.append(probs[0])
                 preds = torch.stack(preds).float()
-            loss = loss_fn(preds, Y_batch)
-            loss.backward()
-            opts[name].step()
-            loss_lists[name].append(loss.item())
+                preds = preds.clamp(P_EPS, 1.0 - P_EPS)
+
+                bias_l2 = (bias ** 2).sum(dim=1).mean()
+                bce_loss = loss_fn(preds, Y_batch) + BIAS_L2_LAMBDA * bias_l2
+
+                mse_metric = ((preds - Y_batch) ** 2).mean()
+
+                bce_loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_NORM)
+
+                opts[name].step()
+                loss_lists[name].append(float(mse_metric.item()))
 
     final_energy = {name: pnp.mean(energy[-ave_len:]) for name, energy in loss_lists.items()}
 
@@ -486,29 +519,26 @@ if __name__ == "__main__":
     logger = setup_logger()
     logger.info("Starting prefactor analysis...")
 
-    # os.environ.setdefault("OMP_NUM_THREADS", "1")
-    # os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-    # os.environ.setdefault("MKL_NUM_THREADS", "1")
-    # os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
-    # os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-    # os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
-    # os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
-    # torch.set_num_threads(1)
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+    os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+    torch.set_num_threads(1)
 
-    # circuit_filename = 'prefactor_tune/28_main_more_gate_generated_circuit.json'
-    # data_filename = 'prefactor_tune/28_main_more_gate_data_store.pkl'
-    circuit_filename = '28_main_more_gate_generated_circuit.json'
-    data_filename = '28_main_more_gate_data_store.pkl'
+    circuit_filename = 'prefactor_tune/28_main_more_gate_generated_circuit.json'
+    data_filename = 'prefactor_tune/28_main_more_gate_data_store.pkl'
 
     batch_size = 25
     n_layer = 1
-    n_circuit = 3  # 50
-    epoch = 10  # 100
-    averaging_length = 2  # 10
+    n_circuit = 2  # 50
+    epoch = 100  # 100
+    averaging_length = 10  # 10
     num_cpus = 2  # 16
     repeat = num_cpus
-    # html_filename = f"prefactor_tune/indept_add_epoch{epoch}"
-    html_filename = f"epoch{epoch}"
+    html_filename = f"prefactor_tune/epoch{epoch}"
 
     gate_type = ['RX', 'RY', 'RZ', 'CNOT', 'H', 'I']
     max_gate = 28
