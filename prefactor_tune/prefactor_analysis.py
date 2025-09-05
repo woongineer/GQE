@@ -4,6 +4,7 @@ import os
 import pickle
 import random
 import time
+from datetime import datetime
 from multiprocessing import get_context
 
 import pandas as pd
@@ -108,6 +109,22 @@ def make_random_circuit(gate_type, max_gate, num_qubits, scales):
                 circuit.append([gate, param_idx, [target, None]])
 
     return circuit
+
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def save_final_model(save_path, name, model, arch_info, losses, metric, epoch, ave_len):
+    payload = {"model_name": name,
+               "state_dict": model.state_dict(),
+               "arch_info": arch_info,
+               "loss_trace": losses,
+               "final_metric": float(metric),
+               "epoch": int(epoch),
+               "averaging_length": int(ave_len),
+               "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}
+    torch.save(payload, save_path)
 
 
 ########################## Graph ##########################
@@ -254,17 +271,28 @@ def run_compare_wrapper(args):
     torch.manual_seed(seed)
 
     logger.info(f"[Worker PID {os.getpid()}] Using seed: {seed}")
+
+    save_root = args.pop("save_root", None)
+    worker_dir = None
+    if save_root is not None:
+        run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+        worker_dir = os.path.join(save_root, f"worker_pid{os.getpid()}_{run_tag}")
+        ensure_dir(worker_dir)
+        logger.info(f"[Worker PID {os.getpid()}] save dir: {worker_dir}")
+    args["save_dir"] = worker_dir
     return run_compare(**args)
 
 
 def run_compare(data_x, data_y, num_qubits, n_layer, batch_size, epoch, good_circuits, bad_circuits, rand_circuits,
-                ave_len):
+                ave_len, save_dir=None):
     logger.info("Running comparison...")
     logger.info(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
 
     opts = {}
     nets = {}
     qnodes = {}
+    arch_infos = {}
+
     for i in range(len(good_circuits)):
         gate_seq = good_circuits.iloc[i]['gen_op_seq']
         num_of_bias = count_param_gates(gate_seq)
@@ -273,6 +301,7 @@ def run_compare(data_x, data_y, num_qubits, n_layer, batch_size, epoch, good_cir
         nets[name] = BiasNet(num_of_bias=num_of_bias, num_of_feature=num_qubits)
         opts[name] = optim.RMSprop(nets[name].parameters(), lr=0.0005, alpha=0.99, eps=1e-6, weight_decay=0.0)
         qnodes[name] = build_qnode_with_bias(num_qubits, gate_seq)
+        arch_infos[name] = {"type": "structured", "num_qubits": num_qubits, "gate_seq": gate_seq}
 
     for i in range(len(bad_circuits)):
         gate_seq = bad_circuits.iloc[i]['gen_op_seq']
@@ -282,6 +311,7 @@ def run_compare(data_x, data_y, num_qubits, n_layer, batch_size, epoch, good_cir
         nets[name] = BiasNet(num_of_bias=num_of_bias, num_of_feature=num_qubits)
         opts[name] = optim.RMSprop(nets[name].parameters(), lr=0.0005, alpha=0.99, eps=1e-6, weight_decay=0.0)
         qnodes[name] = build_qnode_with_bias(num_qubits, gate_seq)
+        arch_infos[name] = {"type": "structured", "num_qubits": num_qubits, "gate_seq": gate_seq}
 
     for i in range(len(rand_circuits)):
         gate_seq = rand_circuits[i]
@@ -291,15 +321,18 @@ def run_compare(data_x, data_y, num_qubits, n_layer, batch_size, epoch, good_cir
         nets[name] = BiasNet(num_of_bias=num_of_bias, num_of_feature=num_qubits)
         opts[name] = optim.RMSprop(nets[name].parameters(), lr=0.0005, alpha=0.99, eps=1e-6, weight_decay=0.0)
         qnodes[name] = build_qnode_with_bias(num_qubits, gate_seq)
+        arch_infos[name] = {"type": "structured", "num_qubits": num_qubits, "gate_seq": gate_seq}
 
     zz_bias_num = count_param_gates_zz(n_layer)
     nets["zz"] = BiasNet(num_of_bias=zz_bias_num, num_of_feature=num_qubits)
     opts["zz"] = optim.RMSprop(nets["zz"].parameters(), lr=0.0005, alpha=0.99, eps=1e-6, weight_decay=0.0)
     qnodes["zz"] = build_zz_qnode_with_bias(num_qubits, n_layer)
+    arch_infos["zz"] = {"type": "zz_bias", "num_qubits": num_qubits, "n_layer": n_layer}
 
     nets["zz_nqe"] = EncoderNet(num_of_feature=num_qubits)
     opts["zz_nqe"] = optim.RMSprop(nets["zz_nqe"].parameters(), lr=0.0005, alpha=0.99, eps=1e-6, weight_decay=0.0)
     qnodes["zz_nqe"] = build_zz_qnode_nqe(num_qubits, n_layer)
+    arch_infos["zz_nqe"] = {"type": "zz_nqe", "num_qubits": num_qubits, "n_layer": n_layer}
 
     loss_lists = {name: [] for name in nets.keys()}
 
@@ -354,6 +387,21 @@ def run_compare(data_x, data_y, num_qubits, n_layer, batch_size, epoch, good_cir
                 loss_lists[name].append(float(mse_metric.item()))
 
     final_energy = {name: pnp.mean(energy[-ave_len:]) for name, energy in loss_lists.items()}
+
+    if save_dir is not None:
+        ensure_dir(save_dir)
+        for name, model in nets.items():
+            metric = final_energy[name]
+            fpath = os.path.join(save_dir, f"{name}.pt")
+            save_final_model(save_path=fpath,
+                             name=name,
+                             model=model,
+                             arch_info=arch_infos[name],
+                             losses=loss_lists[name],
+                             metric=metric,
+                             epoch=epoch,
+                             ave_len=ave_len)
+            logger.info(f"[{name}] saved at {fpath} (metric={metric:.6f})")
 
     return {"final": final_energy, "trace": loss_lists}
 
@@ -528,17 +576,21 @@ if __name__ == "__main__":
     os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
     torch.set_num_threads(1)
 
-    circuit_filename = 'prefactor_tune/28_main_more_gate_generated_circuit.json'
-    data_filename = 'prefactor_tune/28_main_more_gate_data_store.pkl'
+    # circuit_filename = 'prefactor_tune/28_main_more_gate_generated_circuit.json'
+    # data_filename = 'prefactor_tune/28_main_more_gate_data_store.pkl'
+    circuit_filename = '28_main_more_gate_generated_circuit.json'
+    data_filename = '28_main_more_gate_data_store.pkl'
 
     batch_size = 25
     n_layer = 1
-    n_circuit = 2  # 50
-    epoch = 100  # 100
-    averaging_length = 10  # 10
+    n_circuit = 2  # 30
+    epoch = 10  # 1000
+    averaging_length = 2  # 10
     num_cpus = 2  # 16
     repeat = num_cpus
-    html_filename = f"prefactor_tune/epoch{epoch}"
+    # html_filename = f"prefactor_tune/epoch{epoch}"
+    html_filename = f"epoch{epoch}"
+    save_root = ensure_dir(f"{html_filename}_models")
 
     gate_type = ['RX', 'RY', 'RZ', 'CNOT', 'H', 'I']
     max_gate = 28
@@ -565,7 +617,8 @@ if __name__ == "__main__":
                                    good_circuits=good_circuits,
                                    bad_circuits=bad_circuits,
                                    rand_circuits=rand_circuits,
-                                   ave_len=averaging_length)
+                                   ave_len=averaging_length,
+                                   save_root=save_root)
 
     logger.info('Analysis finished...')
 
