@@ -7,12 +7,10 @@ __pycache__/
 *.pt
 *.html
 *.pth
-*.pt
 *.npz
 *.csv
 *.log
 *.pkl
-*.json
 .idea/
 .DS_Store
 ._.DS_Store
