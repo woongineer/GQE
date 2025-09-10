@@ -126,7 +126,7 @@ def new_data(batch_size, X, Y):
 
 if __name__ == "__main__":
     # load data
-    data_filename = '28_main_more_gate_data_store.pkl'
+    data_filename = '../prefactor_tune/28_main_more_gate_data_store.pkl'
     X_train, Y_train, _ = get_data(data_filename)
 
     N_layers = 1
