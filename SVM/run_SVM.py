@@ -2,10 +2,8 @@ import logging
 import multiprocessing as mp
 import os
 import time
-import traceback
 from collections import defaultdict
 from functools import partial
-from logging.handlers import QueueHandler, QueueListener
 
 import numpy as np
 import numpy as pnp
@@ -17,11 +15,13 @@ import torch.nn as nn
 from sklearn.decomposition import PCA
 from sklearn.svm import SVC
 
-LOGGER_NAME = "svm_eval"
-LOG_QUEUE = None
+
+###################################### logging ######################################
+
+logger_name = "svm_eval"
 
 
-def _set_single_thread_env():
+def set_single_thread_env():
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -29,50 +29,21 @@ def _set_single_thread_env():
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
     os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
     os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
-    try:
-        torch.set_num_threads(1)
-    except Exception:
-        pass
+    torch.set_num_threads(1)
 
 
-def _build_console_handler(level=logging.INFO):
-    ch = logging.StreamHandler()
-    ch.setLevel(level)
-    fmt = logging.Formatter("[%(asctime)s][%(processName)s][%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S", )
-    ch.setFormatter(fmt)
-    return ch
+def setup_logging(level=logging.INFO):
+    logging.basicConfig(level=level, format="[%(asctime)s][%(processName)s][%(levelname)s] %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S", force=True, )
+    return logging.getLogger(logger_name)
 
 
-def setup_main_logging(level=logging.INFO):
-    log_queue: mp.Queue = mp.Queue(-1)
-    console = _build_console_handler(level)
-
-    listener = QueueListener(log_queue, console, respect_handler_level=True)
-    listener.start()
-
-    logger = logging.getLogger(LOGGER_NAME)
-    logger.setLevel(level)
-    logger.handlers.clear()
-    logger.propagate = False
-    logger.addHandler(QueueHandler(log_queue))
-    return log_queue, listener
-
-
-def setup_worker_logging(log_queue, level=logging.INFO):
-    logger = logging.getLogger(LOGGER_NAME)
-    logger.setLevel(level)
-    logger.handlers.clear()
-    logger.propagate = False
-    logger.addHandler(QueueHandler(log_queue))
-    return logger
+###################################### data ######################################
 
 
 def data_load_and_process(reduction_sz, train_len, test_len, train_start, test_start, data_path):
-    logger = logging.getLogger(LOGGER_NAME)
-    t0 = time.perf_counter()
-    logger.info(f"[data] load KMNIST: path={data_path}, reduction={reduction_sz}, "
-                f"train_len={train_len}, test_len={test_len}, "
-                f"train_start={train_start}, test_start={test_start}")
+    logger = logging.getLogger(logger_name)
+    logger.info(f"KMNIST: train/test from = {train_start}/{test_start}, train/test len = {train_len}/{test_len}")
 
     kmnist_train_images_path = f"{data_path}/kmnist-train-imgs.npz"
     kmnist_train_labels_path = f"{data_path}/kmnist-train-labels.npz"
@@ -113,9 +84,6 @@ def data_load_and_process(reduction_sz, train_len, test_len, train_start, test_s
         x = (x - x.min()) * (2 * pnp.pi / (rng if rng != 0 else 1.0))
         x_test_out.append(x)
 
-    dt = time.perf_counter() - t0
-    logger.info(f"[data] finished: train={len(x_train_out)}, test={len(x_test_out)}, took {dt:.2f}s")
-
     return x_train_out, x_test_out, y_tr_sel, y_te_sel
 
 
@@ -131,16 +99,7 @@ def make_data_slices_pairwise(n_pairs, train_len, test_len, train_start0, test_s
     return specs
 
 
-def zz_feature_map(x, wires):
-    n = len(wires)
-    for i in range(n):
-        qml.Hadamard(wires=wires[i])
-        qml.RZ(x[i], wires=wires[i])
-    for i in range(n):
-        for j in range(i + 1, n):
-            qml.CNOT(wires=[wires[i], wires[j]])
-            qml.RZ(2.0 * x[i] * x[j], wires=wires[j])
-            qml.CNOT(wires=[wires[i], wires[j]])
+###################################### SVM related ######################################
 
 
 def make_overlap_kernel(embedding_fn, num_qubits: int):
@@ -160,52 +119,47 @@ def make_overlap_kernel(embedding_fn, num_qubits: int):
 
 
 def fit_eval_svm(X_train, y_train, X_test, y_test, kernel_callable, C: float = 0.1):
-    logger = logging.getLogger(LOGGER_NAME)
-    t0 = time.perf_counter()
-    logger.info(f"[svm] building kernel matrices: train={len(X_train)}, test={len(X_test)}, C={C}")
     K_train = qml.kernels.kernel_matrix(X_train, X_train, kernel_callable)
     clf = SVC(C=C, kernel="precomputed").fit(K_train, y_train)
     train_acc = clf.score(K_train, y_train)
     K_test = qml.kernels.kernel_matrix(X_test, X_train, kernel_callable)
     test_acc = clf.score(K_test, y_test)
-    dt = time.perf_counter() - t0
-    logger.info(f"[svm] done: train_acc={train_acc:.4f}, test_acc={test_acc:.4f}, took {dt:.2f}s")
     return train_acc, test_acc
 
 
-def load_bias_model(ckpt_path):
-    payload = torch.load(ckpt_path, map_location="cpu")
-    return payload["state_dict"], payload["arch_info"]
+###################################### build/restore model ######################################
 
 
-def count_param_gates(gate_seq):
-    return sum(g[1] is not None for g in gate_seq)
+def load_ckpt(ckpt_path):
+    model = torch.load(ckpt_path, map_location="cpu")
+    return model["state_dict"], model["arch_info"]
 
 
-class _FeatHead(nn.Module):
-    def __init__(self, num_of_bias, num_of_feature):
+
+def zz_apply_default(x, wires):
+    n = len(wires)
+    for i in range(n):
+        qml.Hadamard(wires=wires[i])
+        qml.RZ(x[i], wires=wires[i])
+    for i in range(n):
+        for j in range(i + 1, n):
+            qml.CNOT(wires=[wires[i], wires[j]])
+            qml.RZ(2.0 * x[i] * x[j], wires=wires[j])
+            qml.CNOT(wires=[wires[i], wires[j]])
+
+
+class BiasNet(nn.Module):
+    def __init__(self, num_bias, num_feat):
         super().__init__()
         self.feat = nn.Sequential(
-            nn.Linear(num_of_feature, num_of_feature * 4), nn.ReLU(),
-            nn.Linear(num_of_feature * 4, num_of_feature * 2), nn.ReLU(),
+            nn.Linear(num_feat, num_feat * 4), nn.ReLU(),
+            nn.Linear(num_feat * 4, num_feat * 2), nn.ReLU(),
         )
-        self.head = nn.Linear(num_of_feature * 2, num_of_bias, bias=True)
+        self.head = nn.Linear(num_feat * 2, num_bias, bias=True)
 
     def forward(self, x):
         z = self.feat(x)
         return self.head(z)
-
-
-def build_single_input_bias_net(state_dict: dict, num_bias: int, num_feat: int):
-    net = _FeatHead(num_of_bias=num_bias, num_of_feature=num_feat)
-    with torch.no_grad():
-        for k, v in net.state_dict().items():
-            if k in state_dict:
-                v.copy_(state_dict[k])
-            else:
-                raise KeyError(f"state_dict key '{k}' not found in checkpoint.")
-    net.eval()
-    return net
 
 
 def apply_structure(gate_seq, x, bias):
@@ -232,11 +186,11 @@ def apply_structure(gate_seq, x, bias):
 
 
 def make_user_embedding_from_ckpt(ckpt_path: str, num_feat: int):
-    state, arch = load_bias_model(ckpt_path)
+    state, arch = load_ckpt(ckpt_path)
     assert arch["type"] == "structured"
     gate_seq = arch["gate_seq"]
     num_bias = count_param_gates(gate_seq)
-    net = build_single_input_bias_net(state, num_bias=num_bias, num_feat=num_feat)
+    net = build_model(BiasNet, state, num_bias=num_bias, num_feat=num_feat)
 
     def user_embedding(x, wires):
         with torch.no_grad():
@@ -248,7 +202,7 @@ def make_user_embedding_from_ckpt(ckpt_path: str, num_feat: int):
 
 
 def make_user_embedding_from_ckpt_no_bias(ckpt_path: str, num_feat: int):
-    _, arch = load_bias_model(ckpt_path)
+    _, arch = load_ckpt(ckpt_path)
     assert arch["type"] == "structured"
     gate_seq = arch["gate_seq"]
     num_bias = count_param_gates(gate_seq)
@@ -260,32 +214,30 @@ def make_user_embedding_from_ckpt_no_bias(ckpt_path: str, num_feat: int):
     return user_embedding_no_bias
 
 
-class _EncoderNet(nn.Module):
-    def __init__(self, num_of_feature):
+class NQE(nn.Module):
+    def __init__(self, num_feat):
         super().__init__()
         self.enc = nn.Sequential(
-            nn.Linear(num_of_feature, num_of_feature * 2), nn.ReLU(),
-            nn.Linear(num_of_feature * 2, num_of_feature * 2), nn.ReLU(),
-            nn.Linear(num_of_feature * 2, num_of_feature),
+            nn.Linear(num_feat, num_feat * 2), nn.ReLU(),
+            nn.Linear(num_feat * 2, num_feat * 2), nn.ReLU(),
+            nn.Linear(num_feat * 2, num_feat),
         )
 
     def forward(self, x):
         return self.enc(x)
 
 
-def build_encoder_net(state_dict: dict, num_feat: int):
-    net = _EncoderNet(num_of_feature=num_feat)
+def build_model(net_cls, state_dict: dict, **kwargs):
+    net = net_cls(**kwargs)
     with torch.no_grad():
         for k, v in net.state_dict().items():
-            if k in state_dict:
-                v.copy_(state_dict[k])
-            else:
-                raise KeyError(f"[zz_nqe] state_dict key '{k}' not found in checkpoint.")
+            v.copy_(state_dict[k])
     net.eval()
     return net
 
 
-def apply_zz_no_bias(n_layers: int, z, wires):
+
+def zz_apply_nqe(n_layers: int, z, wires):
     n = len(wires)
     for _ in range(n_layers):
         for i in range(n):
@@ -299,98 +251,86 @@ def apply_zz_no_bias(n_layers: int, z, wires):
 
 
 def make_zz_nqe_embedding_from_ckpt(ckpt_path: str, num_feat: int):
-    state, arch = load_bias_model(ckpt_path)
+    state, arch = load_ckpt(ckpt_path)
     assert arch["type"] == "zz_nqe"
     n_layers = int(arch.get("n_layer", 1))
-    enc = build_encoder_net(state, num_feat=num_feat)
+    net = build_model(NQE, state, num_feat=num_feat)
 
     def zz_nqe_embedding(x, wires):
         with torch.no_grad():
             xt = torch.tensor(x, dtype=torch.float32).view(1, -1)
-            z = enc(xt)[0].cpu().numpy()
-        apply_zz_no_bias(n_layers, z, wires)
+            z = net(xt)[0].cpu().numpy()
+        zz_apply_nqe(n_layers, z, wires)
 
     return zz_nqe_embedding
 
 
-def _worker_eval_ckpt(ckpt_file, ckpt_dir, num_qubits, C, X_train, X_test, y_train, y_test):
-    _set_single_thread_env()
+###################################### Runner ######################################
 
-    logger = setup_worker_logging(LOG_QUEUE, level=logging.INFO)
+
+def worker_eval_ckpt(ckpt_file, ckpt_dir, num_qubits, C, X_train, X_test, y_train, y_test):
+    set_single_thread_env()
+    setup_logging(level=logging.INFO)
+    logger = logging.getLogger(logger_name)
+    t0 = time.perf_counter()
 
     ckpt_path = os.path.join(ckpt_dir, ckpt_file)
-    if os.path.basename(ckpt_path) == "zz.pt":
-        return []
-
     outs = []
-    try:
-        logger.info(f"[worker] start ckpt: {ckpt_path}")
-        t0 = time.perf_counter()
-        _, arch = load_bias_model(ckpt_path)
-        arch_type = arch.get("type", "structured")
 
-        if arch_type == "structured":
-            base_label = os.path.splitext(os.path.basename(ckpt_path))[0]  # G1, B3, ...
+    _, arch = load_ckpt(ckpt_path)
+    arch_type = arch.get("type", "structured")
 
-            user_emb_bias = make_user_embedding_from_ckpt(ckpt_path, num_feat=num_qubits)
-            kernel_bias = make_overlap_kernel(user_emb_bias, num_qubits=num_qubits)
-            tr_b, te_b = fit_eval_svm(X_train, y_train, X_test, y_test, kernel_bias, C=C)
-            outs.append((f"{base_label}_Bias", float(tr_b), float(te_b)))
+    if arch_type == "structured":
+        base_label = os.path.splitext(os.path.basename(ckpt_path))[0]
 
-            user_emb_plain = make_user_embedding_from_ckpt_no_bias(ckpt_path, num_feat=num_qubits)
-            kernel_plain = make_overlap_kernel(user_emb_plain, num_qubits=num_qubits)
-            tr_p, te_p = fit_eval_svm(X_train, y_train, X_test, y_test, kernel_plain, C=C)
-            outs.append((f"{base_label}", float(tr_p), float(te_p)))
+        user_emb_bias = make_user_embedding_from_ckpt(ckpt_path, num_feat=num_qubits)
+        kernel_bias = make_overlap_kernel(user_emb_bias, num_qubits=num_qubits)
+        tr_b, te_b = fit_eval_svm(X_train, y_train, X_test, y_test, kernel_bias, C=C)
+        outs.append((f"{base_label}_Bias", float(tr_b), float(te_b)))
 
-        elif arch_type == "zz_nqe":
-            zznqe_emb = make_zz_nqe_embedding_from_ckpt(ckpt_path, num_feat=num_qubits)
-            kernel = make_overlap_kernel(zznqe_emb, num_qubits=num_qubits)
-            tr, te = fit_eval_svm(X_train, y_train, X_test, y_test, kernel, C=C)
-            outs.append(("zz_nqe", float(tr), float(te)))
+        user_emb_plain = make_user_embedding_from_ckpt_no_bias(ckpt_path, num_feat=num_qubits)
+        kernel_plain = make_overlap_kernel(user_emb_plain, num_qubits=num_qubits)
+        tr_p, te_p = fit_eval_svm(X_train, y_train, X_test, y_test, kernel_plain, C=C)
+        outs.append((f"{base_label}", float(tr_p), float(te_p)))
 
+    elif arch_type == "zz_nqe":
+        zznqe_emb = make_zz_nqe_embedding_from_ckpt(ckpt_path, num_feat=num_qubits)
+        kernel = make_overlap_kernel(zznqe_emb, num_qubits=num_qubits)
+        tr, te = fit_eval_svm(X_train, y_train, X_test, y_test, kernel, C=C)
+        outs.append(("zz_nqe", float(tr), float(te)))
+
+    logger.info(f"ckpt: {ckpt_path}, results={outs}, took {time.perf_counter() - t0:.2f}s")
+    return outs
+
+
+def eval_ckpt_dir(ckpt_dir, num_workers, num_qubits, C, include, X_train, X_test, y_train, y_test):
+    files_all = {f for f in os.listdir(ckpt_dir) if f.endswith(".pt")}
+    model_types = include['model_type']
+    upto = include['upto']
+    wanted = []
+    for mt in model_types:
+        if mt == "zz_nqe":
+            wanted.append("zz_nqe.pt")
         else:
-            logger.warning(f"[worker] unknown arch type '{arch_type}' in {ckpt_path}, skip.")
-            return []
+            wanted.extend(f"{mt}{i}.pt" for i in range(1, upto + 1))
+    files = sorted([f for f in wanted if f in files_all])
 
-        dt = time.perf_counter() - t0
-        logger.info(f"[worker] done ckpt: {ckpt_path}, results={outs}, took {dt:.2f}s")
-        return outs
-
-    except Exception as e:
-        logger.error(f"[worker] error on {ckpt_path}: {e}\n{traceback.format_exc()}")
-        return []
-
-
-def eval_ckpt_dir(ckpt_dir, num_workers, num_qubits, C, X_train, X_test, y_train, y_test):
-    files = [f for f in os.listdir(ckpt_dir) if f.endswith(".pt") and f != "zz.pt"]
-    files.sort()
-    logger = logging.getLogger(LOGGER_NAME)
-    logger.info(f"[dir] evaluate {len(files)} ckpts in: {ckpt_dir}")
-    worker = partial(
-        _worker_eval_ckpt,
-        ckpt_dir=ckpt_dir,
-        num_qubits=num_qubits, C=C,
-        X_train=X_train, X_test=X_test, y_train=y_train, y_test=y_test
-    )
+    worker = partial(worker_eval_ckpt, ckpt_dir=ckpt_dir, num_qubits=num_qubits, C=C,
+                     X_train=X_train, X_test=X_test, y_train=y_train, y_test=y_test)
     results = []
     with mp.Pool(processes=num_workers, maxtasksperchild=1) as pool:
         for outs in pool.imap(worker, files, chunksize=1):
-            if outs:
-                results.extend(outs)
-    logger.info(f"[dir] finished dir: {ckpt_dir}, collected {len(results)} result rows")
+            results += outs
     return results
 
 
-def run_pairwise(models_root, num_workers, num_qubits, C, data_path,
+def run_pairwise(models_root, num_workers, num_qubits, C, data_path, include,
                  train_len, test_len, train_start0, test_start0, stride_train, stride_test):
-    subdirs = [os.path.join(models_root, d) for d in os.listdir(models_root)
-               if os.path.isdir(os.path.join(models_root, d))]
-    subdirs.sort()
+    subdirs = sorted(os.path.join(models_root, d) for d in os.listdir(models_root))
     n_pairs = len(subdirs)
 
-    logger = logging.getLogger(LOGGER_NAME)
-    logger.info(f"[run] models_root={models_root}, subdirs={n_pairs}, "
-                f"num_qubits={num_qubits}, C={C}, workers={num_workers}")
+    logger = logging.getLogger(logger_name)
+    logger.info(f"models_root={models_root}, subdirs={n_pairs}, C={C}, workers={num_workers}")
 
     data_slices = make_data_slices_pairwise(
         n_pairs=n_pairs,
@@ -403,45 +343,41 @@ def run_pairwise(models_root, num_workers, num_qubits, C, data_path,
     agg_test = defaultdict(list)
 
     for i, (ckpt_dir, sl) in enumerate(zip(subdirs, data_slices), start=1):
-        logger.info(f"[run] ===== Pair {i}/{n_pairs} ===== dir={ckpt_dir} | slice={sl}")
+        logger.info(f"====== Pair {i}/{n_pairs} ====== dir={ckpt_dir} | slice={sl}")
         t_pair = time.perf_counter()
 
-        # 데이터 로딩 (슬라이스 i)
-        X_tr, X_te, y_tr, y_te = data_load_and_process(
-            reduction_sz=num_qubits,
-            train_len=sl["train_len"], test_len=sl["test_len"],
-            train_start=sl["train_start"], test_start=sl["test_start"],
-            data_path=data_path,
-        )
+        X_tr, X_te, y_tr, y_te = data_load_and_process(reduction_sz=num_qubits,
+                                                       train_len=sl["train_len"], test_len=sl["test_len"],
+                                                       train_start=sl["train_start"], test_start=sl["test_start"],
+                                                       data_path=data_path)
 
-        logger.info("[run] baseline ZZ-FMAP: start")
         t0 = time.perf_counter()
-        kernel_zz = make_overlap_kernel(zz_feature_map, num_qubits=num_qubits)
-        za, zb = fit_eval_svm(X_tr, y_tr, X_te, y_te, kernel_zz, C=C)
-        agg_train["ZZ-FMAP"].append(float(za))
-        agg_test["ZZ-FMAP"].append(float(zb))
-        logger.info(f"[run] baseline ZZ-FMAP: done train={za:.4f}, test={zb:.4f}, took {time.perf_counter() - t0:.2f}s")
+        kernel_zz = make_overlap_kernel(zz_apply_default, num_qubits=num_qubits)
+        zz_train, zz_test = fit_eval_svm(X_tr, y_tr, X_te, y_te, kernel_zz, C=C)
+        agg_train["zz"].append(float(zz_train))
+        agg_test["zz"].append(float(zz_test))
+        logger.info(f"baseline zz: train={zz_train:.4f}, test={zz_test:.4f}, took {time.perf_counter() - t0:.2f}s")
 
-        res = eval_ckpt_dir(
-            ckpt_dir=ckpt_dir,
-            num_workers=num_workers,
-            num_qubits=num_qubits,
-            C=C,
-            X_train=X_tr, X_test=X_te, y_train=y_tr, y_test=y_te
-        )
+        res = eval_ckpt_dir(ckpt_dir=ckpt_dir, num_workers=num_workers, num_qubits=num_qubits, C=C, include=include,
+                            X_train=X_tr, X_test=X_te, y_train=y_tr, y_test=y_te)
         for label, tr, te in res:
             agg_train[label].append(tr)
             agg_test[label].append(te)
 
-        logger.info(f"[run] ===== End Pair {i}/{n_pairs} ===== took {time.perf_counter() - t_pair:.2f}s")
+        logger.info(f"====== End Pair {i}/{n_pairs} ====== took {time.perf_counter() - t_pair:.2f}s")
 
     return agg_train, agg_test
 
 
+###################################### plot & utils ######################################
+
+
+def count_param_gates(gate_seq):
+    return sum(g[1] is not None for g in gate_seq)
+
+
 def plot_errorbars(agg_train, agg_test, C, any_train_len, any_test_len, save_path="svm_errorbars.html"):
-    logger = logging.getLogger(LOGGER_NAME)
-    logger.info(f"[plot] start: {save_path}")
-    t0 = time.perf_counter()
+    logger = logging.getLogger(logger_name)
     labels = sorted(
         agg_test.keys(),
         key=lambda k: (np.mean(agg_test[k]) if len(agg_test[k]) > 0 else 0.0),
@@ -498,61 +434,43 @@ def plot_errorbars(agg_train, agg_test, C, any_train_len, any_test_len, save_pat
     )
 
     fig.write_html(save_path, include_plotlyjs="cdn")
-    logger.info(f"[plot] saved: {save_path}, took {time.perf_counter() - t0:.2f}s")
+    logger.info(f"[plot] saved: {save_path}")
 
 
 if __name__ == "__main__":
-    try:
-        mp.set_start_method("fork")
-    except RuntimeError:
-        pass
+    mp.set_start_method("fork")
 
-    LOG_LEVEL = logging.INFO
-    log_queue, log_listener = setup_main_logging(level=LOG_LEVEL)
-
-    LOG_QUEUE = log_queue
-
-    logger = logging.getLogger(LOGGER_NAME)
-    logger.info("===== START RUN =====")
+    setup_logging(level=logging.INFO)
+    logger = logging.getLogger(logger_name)
+    logger.info("======== START RUN ========")
     t_global = time.perf_counter()
 
-    try:
-        # MODELS_ROOT = "SVM/epoch1000_models"
-        # DATA_PATH = "GQE/kmnist"
-        # output_path = "SVM/svm_errorbars.html"
-        MODELS_ROOT = "epoch1000_models"
-        DATA_PATH = "/Users/jwheo/Desktop/Y/NQE/Neural-Quantum-Embedding/rl/kmnist"
-        output_path = "svm_errorbars.html"
+    # MODELS_ROOT = "SVM/epoch1000_models"
+    # DATA_PATH = "GQE/kmnist"
+    # output_path = "SVM/svm_errorbars.html"
+    model_root = "epoch1000_models"
+    data_path = "/Users/jwheo/Desktop/Y/NQE/Neural-Quantum-Embedding/rl/kmnist"
+    output_path = "svm_errorbars.html"
 
-        num_qubits = 4
-        C = 0.1
-        num_workers = 64
+    num_qubits = 4
+    C = 0.1
+    # num_workers = 64
+    num_workers = 6
+    include = {"upto": 2, "model_type": ["zz_nqe", "G"]}
 
-        # train_len = 500
-        # test_len = 100
-        train_len = 40
-        test_len = 10
-        train_start0, test_start0 = 2000, 100
-        stride_train, stride_test = 500, 100
+    # train_len = 500
+    # test_len = 100
+    train_len = 20
+    test_len = 5
+    train_start0, test_start0 = 2000, 100
+    stride_train, stride_test = 500, 100
 
-        agg_train, agg_test = run_pairwise(
-            models_root=MODELS_ROOT,
-            num_workers=num_workers,
-            num_qubits=num_qubits,
-            C=C,
-            data_path=DATA_PATH,
-            train_len=train_len, test_len=test_len,
-            train_start0=train_start0, test_start0=test_start0,
-            stride_train=stride_train, stride_test=stride_test
-        )
+    agg_train, agg_test = run_pairwise(models_root=model_root, num_workers=num_workers, num_qubits=num_qubits, C=C,
+                                       data_path=data_path, include=include,
+                                       train_len=train_len, test_len=test_len,
+                                       train_start0=train_start0, test_start0=test_start0,
+                                       stride_train=stride_train, stride_test=stride_test)
 
-        plot_errorbars(agg_train, agg_test, C=C, any_train_len=train_len, any_test_len=test_len, save_path=output_path)
+    plot_errorbars(agg_train, agg_test, C=C, any_train_len=train_len, any_test_len=test_len, save_path=output_path)
 
-        logger.info(f"===== END RUN ===== took {time.perf_counter() - t_global:.2f}s")
-
-    finally:
-        # 리스너 정리
-        try:
-            log_listener.stop()
-        except Exception:
-            pass
+    logger.info(f"======== END RUN ======== took {time.perf_counter() - t_global:.2f}s")
